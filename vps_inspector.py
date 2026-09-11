@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""VPS Inspector v0.3.2 - read-only Linux VPS inventory and deployment preflight."""
+"""VPS Inspector v0.4.0 - read-only Linux VPS inventory and deployment preflight."""
 from __future__ import annotations
 import argparse, datetime as dt, difflib, hashlib, ipaddress, json, os, pathlib, platform, pwd, re, shutil, socket, subprocess
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION="0.3.2"; SCHEMA_VERSION=6; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
+VERSION="0.4.0"; SCHEMA_VERSION=7; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
 SENSITIVE=[re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)=([^\s]+)"),re.compile(r"(?i)(--password|--passwd|--token|--secret|--api-key)\s+([^\s]+)")]
 SVC_RE=re.compile(r"(?:^|/)([^/]+\.service)(?:/|$)"); PID_RE=re.compile(r"pid=(\d+)"); PROC_RE=re.compile(r'users:\(\(\"([^\"]+)\"')
 
@@ -327,6 +327,166 @@ class Inspector:
         for fn in (self.system,self.processes,self.systemd,self.cron,self.sockets,self.network,self.containers,self.user_systemd,self.misc):fn()
         self.relationships();r=self.inv["relationships"];d=self.inv["containers"]["docker"];self.inv["summary"]={"process_count":len(self.inv["processes"]),"running_service_count":len(r["running_services"]),"active_exited_service_count":len(r["active_exited_services"]),"enabled_inactive_service_count":len(r["enabled_inactive_services"]),"listener_count":len(r["listeners"]),"wildcard_count":sum(x.get("scope")=="wildcard" for x in r["listeners"]),"netns_count":len(r["network_namespaces"]),"docker_count":len(d.get("containers",[])),"docker_running":sum(bool(c.get("State",{}).get("Running")) for c in d.get("containers",[])),"timer_count":len(self.inv.get("systemd",{}).get("timers",[])),"socket_count":len(self.inv.get("systemd",{}).get("sockets",[])),"cron_count":len(self.inv["cron"]["jobs"]),"package_count":self.inv["packages"]["count"]};self.inv["coverage"]=self.coverage;return self.inv
 
+
+def _mem_kib(inv,key):
+    text=str(inv.get("resources",{}).get("meminfo") or "")
+    m=re.search(rf"(?m)^{re.escape(key)}:\s+(\d+)\s+kB\s*$",text)
+    return int(m.group(1)) if m else None
+
+def _fmt_bytes(n):
+    if n is None:return "unknown"
+    units=["B","KiB","MiB","GiB","TiB"];v=float(n);i=0
+    while v>=1024 and i<len(units)-1:v/=1024;i+=1
+    return f"{v:.1f} {units[i]}"
+
+def _root_disk(inv):
+    raw=str(inv.get("storage",{}).get("df") or "")
+    rows=[]
+    for line in raw.splitlines()[1:]:
+        parts=line.split()
+        if len(parts)>=7:
+            try:rows.append({"filesystem":parts[0],"type":parts[1],"blocks_kib":int(parts[2]),"used_kib":int(parts[3]),"avail_kib":int(parts[4]),"use":parts[5],"mount":" ".join(parts[6:])})
+            except ValueError:pass
+    return next((x for x in rows if x["mount"]=="/"),None)
+
+def _docker_subnets(inv):
+    out=[]
+    for n in inv.get("containers",{}).get("docker",{}).get("networks",[]):
+        for cfg in n.get("Config",[]):
+            if cfg.get("Subnet"):out.append(str(cfg["Subnet"]))
+    return sorted(set(out))
+
+def _firewall_subnets(inv):
+    found=set()
+    for line in inv.get("network",{}).get("firewall",{}).get("interesting_rules",[]):
+        for cidr in re.findall(r"(?<![0-9A-Fa-f:.])(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}(?![0-9])",str(line)):
+            try:found.add(str(ipaddress.ip_network(cidr,strict=False)))
+            except ValueError:pass
+    return sorted(found)
+
+def _important_coverage(inv):
+    critical=("processes","sockets.host","sockets.namespace_coverage","network.addresses","network.routes","systemd.services")
+    return [row for row in inv.get("coverage",[]) if row.get("status") in {"partial","permission_denied","timeout","error"} and str(row.get("collector") or "").startswith(critical)]
+
+def _other_coverage_warnings(inv):
+    important={id(x) for x in _important_coverage(inv)}
+    return [row for row in inv.get("coverage",[]) if row.get("status") in {"partial","permission_denied","timeout","error"} and id(row) not in important]
+
+def _listener_groups(inv):
+    groups={};svcmap={x.get("unit"):x for x in inv.get("relationships",{}).get("services",[])}
+    for x in inv.get("relationships",{}).get("listeners",[]):
+        if x.get("scope") not in {"wildcard","specific/public"}:continue
+        key=(proto(x.get("proto")),int(x.get("port") or 0))
+        g=groups.setdefault(key,{"proto":key[0],"port":key[1],"addresses":set(),"owners":set(),"unknown":False})
+        g["addresses"].add(str(x.get("address") or "*"))
+        owners=[]
+        for service in x.get("systemd_services",[]):
+            effective=(svcmap.get(service) or {}).get("effective_startup")
+            owners.append(service+(" (socket-activated)" if effective=="socket-activated" else ""))
+        owners += ["Docker:"+c for c in x.get("docker_containers",[])]
+        if not owners:owners=list(x.get("process_names",[]))
+        if not owners:g["unknown"]=True;owners=["unknown"]
+        g["owners"].update(owners)
+    return [groups[k] for k in sorted(groups,key=lambda z:(z[0],z[1]))]
+
+def _docker_published(inv):
+    rows=[];seen=set()
+    for c in inv.get("containers",{}).get("docker",{}).get("containers",[]):
+        name=c.get("Name") or "unknown"
+        sources=[c.get("HostConfig",{}).get("PortBindings") or {},c.get("NetworkSettings",{}).get("Ports") or {}]
+        for source in sources:
+            for cp,vals in source.items():
+                cp_proto=proto(cp.split("/")[-1])
+                for v in vals or []:
+                    hp=str(v.get("HostPort") or "")
+                    if not hp.isdigit():continue
+                    row=(str(v.get("HostIp") or "0.0.0.0"),int(hp),cp_proto,name)
+                    if row not in seen:seen.add(row);rows.append(row)
+    return sorted(rows,key=lambda x:(x[2],x[1],x[0],x[3]))
+
+def _nonstandard_startup(inv):
+    cron_jobs=inv.get("cron",{}).get("jobs",[])
+    root_spool=[j for f in inv.get("cron",{}).get("files",[]) if str(f.get("path","")).startswith("/var/spool/cron") for j in f.get("jobs",[])]
+    reboot=[j for j in cron_jobs if str(j.get("schedule"))=="@reboot"]
+    user_units=[]
+    for ru in inv.get("user_systemd",{}).get("runtime_users",[]):
+        for u in ru.get("services",[]):
+            if u.get("active_state")=="active" or u.get("unit_file_state") in {"enabled","enabled-runtime"}:user_units.append((ru.get("user"),u.get("unit"),u.get("active_state"),u.get("sub_state")))
+    unmanaged=inv.get("relationships",{}).get("unmanaged_host_processes",[])
+    actionable=[p for p in unmanaged if str(p.get("name") or "") not in {"bash","sh","sshd","systemd","(sd-pam)"}]
+    return {"cron_total":len(cron_jobs),"root_spool":len(root_spool),"reboot":reboot,"user_units":user_units,"unmanaged":unmanaged,"unmanaged_actionable":actionable}
+
+def _swap_kib(inv):
+    raw=str(inv.get("resources",{}).get("swaps") or "");total=used=0
+    for line in raw.splitlines()[1:]:
+        p=line.split()
+        if len(p)>=5:
+            try:total+=int(p[2]);used+=int(p[3])
+            except ValueError:pass
+    return total,used
+
+def assess_scan(inv):
+    findings=[];high=False
+    coverage=_important_coverage(inv)
+    if coverage:
+        severe=[x for x in coverage if x.get("status") in {"permission_denied","timeout","error"}]
+        findings.append({"level":"HIGH" if severe else "WARN","text":f"{len(coverage)} important collector(s) are incomplete; inspect coverage.json"})
+        high=bool(severe)
+    other_coverage=_other_coverage_warnings(inv)
+    if other_coverage:findings.append({"level":"WARN","text":f"{len(other_coverage)} non-critical collector(s) are incomplete; details saved in coverage.json"})
+    groups=_listener_groups(inv)
+    unknown=[x for x in groups if x["unknown"]]
+    if unknown:
+        findings.append({"level":"HIGH","text":f"{len(unknown)} public/wildcard listener group(s) have unknown ownership"});high=True
+    ns=_nonstandard_startup(inv)
+    if ns["root_spool"]:findings.append({"level":"WARN","text":f"{ns['root_spool']} root crontab job(s) detected"})
+    if ns["reboot"]:findings.append({"level":"WARN","text":f"{len(ns['reboot'])} @reboot cron job(s) detected"})
+    if ns["user_units"]:findings.append({"level":"INFO","text":f"{len(ns['user_units'])} active/enabled user-systemd unit(s) detected"})
+    if ns["unmanaged_actionable"]:findings.append({"level":"WARN","text":f"{len(ns['unmanaged_actionable'])} host process(es) are not attributed to systemd"})
+    docker=set(_docker_subnets(inv));fw=set(_firewall_subnets(inv));orphan=sorted(fw-docker)
+    orphan_private=[]
+    for c in orphan:
+        try:
+            n=ipaddress.ip_network(c,strict=False)
+            if n.is_private:orphan_private.append(c)
+        except ValueError:pass
+    if orphan_private:findings.append({"level":"WARN","text":"Firewall references subnet(s) not present in current Docker networks: "+", ".join(orphan_private[:5])})
+    mem_avail=_mem_kib(inv,"MemAvailable");mem_total=_mem_kib(inv,"MemTotal")
+    if mem_avail is not None and mem_total and (mem_avail<524288 or mem_avail/mem_total<0.10):findings.append({"level":"WARN","text":"Available memory is below 512 MiB or 10%"})
+    disk=_root_disk(inv)
+    if disk and disk.get("blocks_kib") and (disk["avail_kib"]<2*1024*1024 or disk["avail_kib"]/disk["blocks_kib"]<0.10):findings.append({"level":"WARN","text":"Root filesystem free space is below 2 GiB or 10%"})
+    status="HIGH RISK" if high else ("CAUTION" if any(x["level"] in {"WARN","HIGH"} for x in findings) else "READY")
+    return {"status":status,"findings":findings,"listener_groups":groups,"docker_published":_docker_published(inv),"nonstandard":ns,"root_disk":disk,"mem_avail_kib":mem_avail,"mem_total_kib":mem_total,"firewall_orphan_subnets":orphan_private}
+
+def render_terminal_summary(inv,out,verbose=False):
+    a=assess_scan(inv);sysi=inv.get("system",{});res=inv.get("resources",{});bad=_important_coverage(inv)
+    lines=[f"VPS Inspector {VERSION}",f"Host: {sysi.get('hostname')}",f"OS: {sysi.get('os_release',{}).get('PRETTY_NAME') or sysi.get('platform')}",f"Scan coverage: {'CAUTION' if bad else 'OK'}","",f"DEPLOYMENT STATUS: {a['status']}",""]
+    lines.append("Public / wildcard listeners:")
+    if a["listener_groups"]:
+        for g in a["listener_groups"]:
+            addrs=", ".join(sorted(g["addresses"]));owners=", ".join(sorted(g["owners"]))
+            lines.append(f"  {g['proto'].upper():<3} {g['port']:<5} -> {owners} [{addrs}]")
+    else:lines.append("  none observed")
+    lines += ["","Docker published ports:"]
+    if a["docker_published"]:
+        for addr,port,p,name in a["docker_published"]:lines.append(f"  {p.upper():<3} {addr}:{port} -> {name}")
+    else:lines.append("  none observed")
+    ns=a["nonstandard"];lines += ["","Non-standard startup:",f"  cron jobs: {ns['cron_total']} total; root crontab: {ns['root_spool']}; @reboot: {len(ns['reboot'])}",f"  user systemd: {len(ns['user_units'])} active/enabled unit(s)",f"  unmanaged host processes: {len(ns['unmanaged_actionable'])} actionable ({len(ns['unmanaged'])} total)"]
+    subnets=_docker_subnets(inv);lines += ["","Network:","  Docker subnets: "+(", ".join(subnets) if subnets else "none observed")]
+    if a["firewall_orphan_subnets"]:lines.append("  WARNING: firewall references non-current Docker-like subnet(s): "+", ".join(a["firewall_orphan_subnets"]))
+    mem=f"{_fmt_bytes(a['mem_avail_kib']*1024 if a['mem_avail_kib'] is not None else None)} free / {_fmt_bytes(a['mem_total_kib']*1024 if a['mem_total_kib'] is not None else None)}"
+    swap_total,swap_used=_swap_kib(inv);swap=f"{_fmt_bytes(swap_used*1024)} used / {_fmt_bytes(swap_total*1024)}" if swap_total else "none"
+    disk=a["root_disk"];disk_text=_fmt_bytes(disk["avail_kib"]*1024)+" free / "+_fmt_bytes(disk["blocks_kib"]*1024) if disk else "unknown"
+    load=res.get("loadavg");load_text=" ".join(f"{float(x):.2f}" for x in load) if isinstance(load,(list,tuple)) else str(load or "unknown")
+    lines += ["","Resources:",f"  RAM: {mem}",f"  Swap: {swap}",f"  Root disk: {disk_text}",f"  Load: {load_text}","","Findings:"]
+    if a["findings"]:
+        for f in a["findings"][:8]:lines.append(f"  [{f['level']}] {f['text']}")
+    else:lines.append("  [OK] No high-priority deployment warning detected")
+    lines += ["",f"Full report: {out/'report.md'}",f"Inventory:   {out/'inventory.json'}",f"Coverage:    {out/'coverage.json'}"]
+    if verbose:
+        s=inv.get("summary",{});lines += ["","Verbose inventory counters:",f"  Processes: {s.get('process_count',0)}",f"  Long-running systemd services: {s.get('running_service_count',0)}",f"  Active/exited systemd services: {s.get('active_exited_service_count',0)}",f"  Enabled inactive services: {s.get('enabled_inactive_service_count',0)}",f"  Network namespaces: {s.get('netns_count',0)}",f"  Timers: {s.get('timer_count',0)}; sockets: {s.get('socket_count',0)}; packages: {s.get('package_count',0)}"]
+    return "\n".join(lines)
+
 def render(inv):
     s=inv["summary"];r=inv["relationships"];sysi=inv["system"];fw=inv.get("network",{}).get("firewall",{});L=["# VPS Inspector Report","",f"- Tool version: `{VERSION}`",f"- Collected at: `{inv.get('collected_at')}`",f"- Hostname: `{sysi.get('hostname')}`",f"- OS: `{sysi.get('os_release',{}).get('PRETTY_NAME') or sysi.get('platform')}`",f"- Kernel: `{sysi.get('kernel')}`",f"- Root scan: `{sysi.get('is_root')}`","","## Summary","",f"- Processes: **{s['process_count']}**",f"- Long-running services: **{s['running_service_count']}**",f"- Active/exited services: **{s['active_exited_service_count']}**",f"- Enabled inactive services: **{s['enabled_inactive_service_count']}**",f"- Host listeners: **{s['listener_count']}** (wildcard **{s['wildcard_count']}**)",f"- Network namespaces: **{s['netns_count']}**",f"- Docker: **{s['docker_count']}** total / **{s['docker_running']}** running",f"- Timers: **{s['timer_count']}**, sockets: **{s['socket_count']}**, cron jobs: **{s['cron_count']}**","","## Deployment preflight summary","","| Scope | Proto | Address | Port | Owner |","|---|---|---|---:|---|"]
     for x in r["listeners"]:
@@ -454,11 +614,11 @@ def check(snapshot,plan):
 
 def main():
     p=argparse.ArgumentParser();p.add_argument("--version",action="version",version=f"vps-inspector {VERSION}");s=p.add_subparsers(dest="cmd",required=True)
-    a=s.add_parser("scan");a.add_argument("-o","--output");a.add_argument("--timeout",type=int,default=DEFAULT_TIMEOUT)
+    a=s.add_parser("scan");a.add_argument("-o","--output");a.add_argument("--timeout",type=int,default=DEFAULT_TIMEOUT);a.add_argument("--verbose",action="store_true",help="also print inventory counters after the concise deployment summary")
     d=s.add_parser("diff");d.add_argument("before");d.add_argument("after");d.add_argument("-o","--output")
     c=s.add_parser("check");c.add_argument("snapshot");c.add_argument("plan");x=p.parse_args()
     if x.cmd=="scan":
-        out=pathlib.Path(x.output) if x.output else pathlib.Path(dt.datetime.now().strftime("vps-inspector-%Y%m%d-%H%M%S"));inv=Inspector(max(1,x.timeout)).scan();write_outputs(inv,out);print(f"VPS Inspector {VERSION} completed\nReport:    {out/'report.md'}\nInventory: {out/'inventory.json'}\nCoverage:  {out/'coverage.json'}");return 0
+        out=pathlib.Path(x.output) if x.output else pathlib.Path(dt.datetime.now().strftime("vps-inspector-%Y%m%d-%H%M%S"));inv=Inspector(max(1,x.timeout)).scan();write_outputs(inv,out);print(render_terminal_summary(inv,out,verbose=x.verbose));return 0
     if x.cmd=="diff":
         a=json.dumps(normalized(json.loads(pathlib.Path(x.before).read_text())),indent=2,sort_keys=True,ensure_ascii=False).splitlines();b=json.dumps(normalized(json.loads(pathlib.Path(x.after).read_text())),indent=2,sort_keys=True,ensure_ascii=False).splitlines();z="\n".join(difflib.unified_diff(a,b,fromfile=x.before,tofile=x.after,lineterm=""));pathlib.Path(x.output).write_text(z+"\n") if x.output else print(z or "No differences found.");return 1 if z else 0
     return check(pathlib.Path(x.snapshot),pathlib.Path(x.plan))
