@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""VPS Inspector v0.1.0
+"""VPS Inspector v0.2.0
 
-Read-only Linux VPS inventory and deployment conflict preflight tool.
-Designed to prefer observable facts over service-name heuristics and to report
-coverage gaps explicitly instead of treating inaccessible areas as empty.
+Read-only Linux VPS inventory, service relationship report, snapshot diff,
+and deployment conflict preflight tool.
+
+Design goals:
+- Prefer observable kernel/runtime facts over service-name heuristics.
+- Correlate systemd services, processes, sockets and container metadata.
+- Report coverage gaps explicitly instead of treating inaccessible areas as empty.
+- Avoid mutating the host except for writing requested report files.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -23,13 +27,17 @@ import socket
 import subprocess
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+SCHEMA_VERSION = 2
 DEFAULT_TIMEOUT = 8
 MAX_OUTPUT = 2_000_000
 SENSITIVE_ARG_PATTERNS = [
     re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)=([^\s]+)"),
     re.compile(r"(?i)(--password|--passwd|--token|--secret|--api-key)\s+([^\s]+)"),
 ]
+SYSTEMD_SERVICE_RE = re.compile(r"(?:^|/)([^/]+\.service)(?:/|$)")
+SS_PID_RE = re.compile(r"pid=(\d+)")
+SS_PROC_RE = re.compile(r'users:\(\(\"([^\"]+)\"')
 
 
 def utc_now() -> str:
@@ -65,13 +73,17 @@ def which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
+def md(text: Any) -> str:
+    return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
 class Inspector:
     def __init__(self, timeout: int = DEFAULT_TIMEOUT, strict: bool = False):
         self.timeout = timeout
         self.strict = strict
         self.coverage: List[Dict[str, Any]] = []
         self.inventory: Dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "tool": {"name": "vps-inspector", "version": VERSION},
             "collected_at": utc_now(),
         }
@@ -92,8 +104,8 @@ class Inspector:
         safe_env.setdefault("LC_ALL", "C")
         safe_env.setdefault("LANG", "C")
         try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               errors="replace", timeout=timeout or self.timeout, env=safe_env, check=False)
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, errors="replace", timeout=timeout or self.timeout, env=safe_env, check=False)
             stdout = p.stdout[:MAX_OUTPUT]
             stderr = p.stderr[:MAX_OUTPUT]
             status = "ok" if p.returncode == 0 else "error"
@@ -109,7 +121,7 @@ class Inspector:
             return {"ok": False, "status": "error", "stdout": "", "stderr": str(e)}
 
     def collect_system(self) -> None:
-        os_release = {}
+        os_release: Dict[str, str] = {}
         txt = read_text("/etc/os-release")
         if txt:
             for line in txt.splitlines():
@@ -154,7 +166,7 @@ class Inspector:
             base = f"/proc/{pid}"
             try:
                 status = read_text(f"{base}/status", 50_000) or ""
-                data = {}
+                data: Dict[str, str] = {}
                 for line in status.splitlines():
                     if ":" in line:
                         k, v = line.split(":", 1)
@@ -163,25 +175,31 @@ class Inspector:
                 cmdraw = read_text(f"{base}/cmdline", 100_000)
                 cmdline = redact(cmdraw.replace("\x00", " ").strip()) if cmdraw is not None else ""
                 exe = cwd = None
-                try: exe = os.readlink(f"{base}/exe")
-                except OSError: pass
-                try: cwd = os.readlink(f"{base}/cwd")
-                except OSError: pass
-                cgroup = read_text(f"{base}/cgroup", 50_000)
-                stat = read_text(f"{base}/stat", 50_000)
-                start_ticks = None
-                if stat:
-                    parts = stat.split()
-                    if len(parts) > 21: start_ticks = parts[21]
+                try:
+                    exe = os.readlink(f"{base}/exe")
+                except OSError:
+                    pass
+                try:
+                    cwd = os.readlink(f"{base}/cwd")
+                except OSError:
+                    pass
+                cgroup = read_text(f"{base}/cgroup", 50_000) or ""
+                service = self._service_from_cgroup(cgroup)
+                netns = None
+                try:
+                    netns = os.readlink(f"{base}/ns/net")
+                except OSError:
+                    pass
                 uid = user = None
                 if "Uid" in data:
                     try:
                         uid = int(data["Uid"].split()[0]); user = pwd.getpwuid(uid).pw_name
-                    except Exception: pass
+                    except Exception:
+                        pass
                 rows.append({"pid": pid, "ppid": int(data.get("PPid", "0") or 0), "name": data.get("Name"),
                              "state": data.get("State"), "uid": uid, "user": user, "threads": data.get("Threads"),
                              "nspid": data.get("NSpid"), "exe": exe, "cwd": cwd, "cmdline": cmdline[:4000],
-                             "cgroup": (cgroup or "")[:4000], "start_ticks": start_ticks})
+                             "cgroup": cgroup[:4000], "systemd_service": service, "netns": netns})
             except PermissionError:
                 denied += 1
             except FileNotFoundError:
@@ -192,17 +210,89 @@ class Inspector:
         self.inventory["processes"] = rows
         self.mark("processes", "partial" if denied else "ok", f"processes={len(rows)}, denied={denied}")
 
+    @staticmethod
+    def _service_from_cgroup(cgroup: str) -> Optional[str]:
+        matches = SYSTEMD_SERVICE_RE.findall(cgroup or "")
+        return matches[-1] if matches else None
+
     def collect_systemd(self) -> None:
         if not which("systemctl"):
-            self.inventory["systemd"] = {"available": False}; self.mark("systemd", "unsupported", "systemctl not found"); return
+            self.inventory["systemd"] = {"available": False}
+            self.mark("systemd", "unsupported", "systemctl not found")
+            return
         out: Dict[str, Any] = {"available": True}
-        cmds = {"units": ["systemctl", "list-units", "--all", "--no-pager", "--no-legend"],
-                "unit_files": ["systemctl", "list-unit-files", "--no-pager", "--no-legend"],
-                "sockets": ["systemctl", "list-sockets", "--all", "--no-pager", "--no-legend"],
-                "timers": ["systemctl", "list-timers", "--all", "--no-pager", "--no-legend"]}
-        for key, cmd in cmds.items():
-            r = self.run(cmd, f"systemd.{key}", timeout=12); out[key] = redact(r["stdout"])
+        raw_cmds = {
+            "units": ["systemctl", "list-units", "--all", "--no-pager", "--no-legend", "--plain"],
+            "unit_files": ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "--plain"],
+            "sockets": ["systemctl", "list-sockets", "--all", "--no-pager", "--no-legend", "--plain"],
+            "timers": ["systemctl", "list-timers", "--all", "--no-pager", "--no-legend", "--plain"],
+        }
+        for key, cmd in raw_cmds.items():
+            r = self.run(cmd, f"systemd.{key}", timeout=12); out[f"{key}_raw"] = redact(r["stdout"])
+        props = ["Id", "Description", "LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID", "ControlPID", "FragmentPath", "ExecMainStartTimestamp"]
+        show = self.run(["systemctl", "show", "--type=service", "--all", "--no-pager", "--property=" + ",".join(props)],
+                        "systemd.service_properties", timeout=20)
+        out["services"] = self._parse_systemctl_show_blocks(show["stdout"]) if show["ok"] else []
+        enabled = {x["unit"]: x["state"] for x in self._parse_unit_files(out.get("unit_files_raw", ""))}
+        for svc in out["services"]:
+            if svc.get("unit") in enabled and not svc.get("unit_file_state"):
+                svc["unit_file_state"] = enabled[svc["unit"]]
+        out["enabled_units"] = self._parse_unit_files(out.get("unit_files_raw", ""))
+        out["sockets"] = self._parse_systemd_sockets(out.get("sockets_raw", ""))
+        out["timers"] = self._parse_systemd_timers(out.get("timers_raw", ""))
         self.inventory["systemd"] = out
+
+    @staticmethod
+    def _parse_systemctl_show_blocks(text: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for block in re.split(r"\n\s*\n", text.strip()):
+            if not block.strip():
+                continue
+            d: Dict[str, str] = {}
+            for line in block.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1); d[k] = v
+            unit = d.get("Id")
+            if not unit or not unit.endswith(".service"):
+                continue
+            try:
+                main_pid = int(d.get("MainPID", "0") or 0)
+            except ValueError:
+                main_pid = 0
+            rows.append({"unit": unit, "description": d.get("Description"), "load_state": d.get("LoadState"),
+                         "active_state": d.get("ActiveState"), "sub_state": d.get("SubState"),
+                         "unit_file_state": d.get("UnitFileState") or None, "main_pid": main_pid or None,
+                         "fragment_path": d.get("FragmentPath") or None, "started_at": d.get("ExecMainStartTimestamp") or None})
+        return rows
+
+    @staticmethod
+    def _parse_unit_files(text: str) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and "." in parts[0]:
+                rows.append({"unit": parts[0], "state": parts[1], "preset": parts[2] if len(parts) > 2 else ""})
+        return rows
+
+    @staticmethod
+    def _parse_systemd_sockets(text: str) -> List[Dict[str, str]]:
+        rows = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and any(p.endswith(".socket") for p in parts):
+                unit = next((p for p in parts if p.endswith(".socket")), "")
+                activates = parts[-1] if parts[-1].endswith((".service", ".socket")) else ""
+                rows.append({"unit": unit, "activates": activates, "raw": line.strip()})
+        return rows
+
+    @staticmethod
+    def _parse_systemd_timers(text: str) -> List[Dict[str, str]]:
+        rows = []
+        for line in text.splitlines():
+            parts = line.split(); timer = next((p for p in parts if p.endswith(".timer")), "")
+            if timer:
+                rows.append({"unit": timer, "activates": parts[-1] if parts[-1].endswith(".service") else "", "raw": line.strip()})
+        return rows
 
     def collect_cron(self) -> None:
         paths = ["/etc/crontab", "/etc/cron.d", "/etc/cron.daily", "/etc/cron.hourly", "/etc/cron.weekly", "/etc/cron.monthly", "/var/spool/cron", "/var/spool/cron/crontabs"]
@@ -210,8 +300,10 @@ class Inspector:
         for p in paths:
             path = pathlib.Path(p)
             try:
-                if path.is_dir(): entries.append({"path": p, "type": "dir", "entries": sorted(x.name for x in path.iterdir())})
-                elif path.exists(): entries.append({"path": p, "type": "file", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size})
+                if path.is_dir():
+                    entries.append({"path": p, "type": "dir", "entries": sorted(x.name for x in path.iterdir() if not x.name.startswith("."))})
+                elif path.exists():
+                    entries.append({"path": p, "type": "file", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size})
             except PermissionError:
                 entries.append({"path": p, "error": "permission_denied"})
         self.inventory["cron"] = entries; self.mark("cron", "ok")
@@ -222,13 +314,18 @@ class Inspector:
             self.inventory["sockets"] = out; self.mark("sockets", "unsupported", "ss not found"); return
         current = self.run(["ss", "-H", "-lntup"], "sockets.current.tcpudp")
         unix = self.run(["ss", "-H", "-lxup"], "sockets.current.unix")
-        out["current_namespace"] = {"tcp_udp_listen_raw": redact(current["stdout"]), "unix_listen_raw": redact(unix["stdout"]), "parsed_tcp_udp": self._parse_ss(current["stdout"])}
+        out["current_namespace"] = {"tcp_udp_listen_raw": redact(current["stdout"]), "unix_listen_raw": redact(unix["stdout"]),
+                                    "parsed_tcp_udp": self._parse_ss(current["stdout"])}
         ns_map: Dict[str, int] = {}; denied = 0
         for name in os.listdir("/proc"):
-            if not name.isdigit(): continue
-            try: ns_map.setdefault(os.readlink(f"/proc/{name}/ns/net"), int(name))
-            except PermissionError: denied += 1
-            except OSError: continue
+            if not name.isdigit():
+                continue
+            try:
+                ns_map.setdefault(os.readlink(f"/proc/{name}/ns/net"), int(name))
+            except PermissionError:
+                denied += 1
+            except OSError:
+                continue
         for ns, pid in sorted(ns_map.items()):
             row: Dict[str, Any] = {"namespace": ns, "representative_pid": pid}
             if os.geteuid() == 0 and which("nsenter"):
@@ -245,30 +342,40 @@ class Inspector:
         rows = []
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) < 5: continue
+            if len(parts) < 5:
+                continue
             proto, state, local = parts[0], parts[1], parts[4]
             process = " ".join(parts[6:]) if len(parts) > 6 else ""
             host, port = self._split_host_port(local)
-            rows.append({"proto": proto, "state": state, "local": local, "address": host, "port": port, "process": redact(process)})
+            pids = sorted({int(x) for x in SS_PID_RE.findall(process)})
+            names = sorted(set(SS_PROC_RE.findall(process)))
+            rows.append({"proto": proto, "state": state, "local": local, "address": host, "port": port,
+                         "process": redact(process), "pids": pids, "process_names": names})
         return rows
 
     @staticmethod
     def _split_host_port(value: str) -> Tuple[Optional[str], Optional[int]]:
         m = re.match(r"^\[(.*)\]:(\d+)$", value)
-        if m: return m.group(1), int(m.group(2))
+        if m:
+            return m.group(1), int(m.group(2))
         if ":" in value:
             host, p = value.rsplit(":", 1)
-            if p.isdigit(): return host, int(p)
+            if p.isdigit():
+                return host, int(p)
         return value or None, None
 
     def collect_network(self) -> None:
         net: Dict[str, Any] = {}
-        for key, cmd in {"addresses": ["ip", "-j", "address"], "routes": ["ip", "-j", "route", "show", "table", "all"], "rules": ["ip", "-j", "rule"]}.items():
+        for key, cmd in {"addresses": ["ip", "-j", "address"], "routes": ["ip", "-j", "route", "show", "table", "all"],
+                         "rules": ["ip", "-j", "rule"]}.items():
             r = self.run(cmd, f"network.{key}")
             if r["ok"]:
-                try: net[key] = json.loads(r["stdout"])
-                except json.JSONDecodeError: net[key] = r["stdout"]
-            else: net[key] = {"error": r["status"], "stderr": r["stderr"][:2000]}
+                try:
+                    net[key] = json.loads(r["stdout"])
+                except json.JSONDecodeError:
+                    net[key] = r["stdout"]
+            else:
+                net[key] = {"error": r["status"], "stderr": r["stderr"][:2000]}
         net["dns_resolv_conf"] = (read_text("/etc/resolv.conf", 50_000) or "")[:50_000]
         for key, path in {"ip_forward_v4": "/proc/sys/net/ipv4/ip_forward", "ip_local_port_range": "/proc/sys/net/ipv4/ip_local_port_range",
                           "ip_local_reserved_ports": "/proc/sys/net/ipv4/ip_local_reserved_ports", "ipv6_forwarding_all": "/proc/sys/net/ipv6/conf/all/forwarding"}.items():
@@ -276,8 +383,10 @@ class Inspector:
         if which("nft"):
             r = self.run(["nft", "-j", "list", "ruleset"], "network.nft", timeout=12)
             if r["ok"]:
-                try: net["nftables"] = json.loads(r["stdout"])
-                except json.JSONDecodeError: net["nftables_raw"] = r["stdout"]
+                try:
+                    net["nftables"] = json.loads(r["stdout"])
+                except json.JSONDecodeError:
+                    net["nftables_raw"] = r["stdout"]
         elif which("iptables-save"):
             r = self.run(["iptables-save"], "network.iptables", timeout=12); net["iptables_save"] = r["stdout"]
         self.inventory["network"] = net
@@ -289,31 +398,48 @@ class Inspector:
         if runtime == "docker":
             r = self.run(["docker", "info", "--format", "{{json .}}"], "docker.info", timeout=12); out["info_status"] = r["status"]
             if r["ok"]:
-                try: out["info"] = json.loads(r["stdout"])
-                except json.JSONDecodeError: out["info_raw"] = r["stdout"]
+                try:
+                    out["info"] = json.loads(r["stdout"])
+                except json.JSONDecodeError:
+                    out["info_raw"] = r["stdout"]
             ps = self.run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"], "docker.ps", timeout=12)
             containers, ids = [], []
             for line in ps["stdout"].splitlines():
                 try:
                     item = json.loads(line); containers.append(item)
-                    if item.get("ID"): ids.append(item["ID"])
-                except json.JSONDecodeError: pass
+                    if item.get("ID"):
+                        ids.append(item["ID"])
+                except json.JSONDecodeError:
+                    pass
             out["containers_summary"] = containers
             if ids:
                 ins = self.run(["docker", "inspect", *ids], "docker.inspect", timeout=20)
                 if ins["ok"]:
-                    try: out["containers"] = [self._sanitize_container(x) for x in json.loads(ins["stdout"])]
-                    except json.JSONDecodeError: out["containers_inspect_raw"] = redact(ins["stdout"])
+                    try:
+                        out["containers"] = [self._sanitize_container(x) for x in json.loads(ins["stdout"])]
+                    except json.JSONDecodeError:
+                        out["containers_inspect_raw"] = redact(ins["stdout"])
             for key, cmd in {"networks": ["docker", "network", "ls", "--format", "{{json .}}"], "volumes": ["docker", "volume", "ls", "--format", "{{json .}}"]}.items():
-                rr = self.run(cmd, f"docker.{key}"); out[key] = [json.loads(x) for x in rr["stdout"].splitlines() if x.strip().startswith("{")]
+                rr = self.run(cmd, f"docker.{key}"); vals = []
+                for x in rr["stdout"].splitlines():
+                    if x.strip().startswith("{"):
+                        try:
+                            vals.append(json.loads(x))
+                        except json.JSONDecodeError:
+                            pass
+                out[key] = vals
             out["local_socket_candidates"] = self._docker_socket_candidates()
         elif runtime == "podman":
             r = self.run(["podman", "info", "--format", "json"], "podman.info", timeout=12); out["info_status"] = r["status"]
-            try: out["info"] = json.loads(r["stdout"]) if r["ok"] else None
-            except json.JSONDecodeError: out["info_raw"] = r["stdout"]
+            try:
+                out["info"] = json.loads(r["stdout"]) if r["ok"] else None
+            except json.JSONDecodeError:
+                out["info_raw"] = r["stdout"]
             ps = self.run(["podman", "ps", "-a", "--no-trunc", "--format", "json"], "podman.ps", timeout=12)
-            try: out["containers"] = json.loads(ps["stdout"]) if ps["ok"] else []
-            except json.JSONDecodeError: out["containers_raw"] = ps["stdout"]
+            try:
+                out["containers"] = json.loads(ps["stdout"]) if ps["ok"] else []
+            except json.JSONDecodeError:
+                out["containers_raw"] = ps["stdout"]
         return out
 
     def _sanitize_container(self, x: Dict[str, Any]) -> Dict[str, Any]:
@@ -321,30 +447,37 @@ class Inspector:
         labels = cfg.get("Labels") or {}; safe_labels = {k: v for k, v in labels.items() if not re.search(r"(?i)(secret|token|password|key)", k)}
         mounts = [{k: m.get(k) for k in ("Type", "Name", "Source", "Destination", "Mode", "RW", "Propagation")} for m in x.get("Mounts") or []]
         return {"Id": x.get("Id"), "Name": x.get("Name"), "Created": x.get("Created"), "Path": x.get("Path"),
-                "Args": [redact(str(a)) for a in (x.get("Args") or [])], "State": {k: state.get(k) for k in ("Status", "Running", "Paused", "Restarting", "OOMKilled", "Dead", "Pid", "ExitCode", "StartedAt", "FinishedAt")},
-                "Image": x.get("Image"), "Config": {"Hostname": cfg.get("Hostname"), "Image": cfg.get("Image"), "ExposedPorts": cfg.get("ExposedPorts"), "Labels": safe_labels, "User": cfg.get("User"), "WorkingDir": cfg.get("WorkingDir")},
+                "Args": [redact(str(a)) for a in (x.get("Args") or [])],
+                "State": {k: state.get(k) for k in ("Status", "Running", "Paused", "Restarting", "OOMKilled", "Dead", "Pid", "ExitCode", "StartedAt", "FinishedAt")},
+                "Image": x.get("Image"),
+                "Config": {"Hostname": cfg.get("Hostname"), "Image": cfg.get("Image"), "ExposedPorts": cfg.get("ExposedPorts"), "Labels": safe_labels, "User": cfg.get("User"), "WorkingDir": cfg.get("WorkingDir")},
                 "HostConfig": {"NetworkMode": host.get("NetworkMode"), "PortBindings": host.get("PortBindings"), "RestartPolicy": host.get("RestartPolicy"), "Binds": host.get("Binds"), "Privileged": host.get("Privileged")},
                 "NetworkSettings": {"Ports": net.get("Ports"), "Networks": net.get("Networks"), "SandboxKey": net.get("SandboxKey")}, "Mounts": mounts}
 
     def _docker_socket_candidates(self) -> List[Dict[str, Any]]:
         cands = []
         for p in [pathlib.Path("/var/run/docker.sock"), pathlib.Path("/run/docker.sock")]:
-            if p.exists(): cands.append({"path": str(p), "owner_uid": p.stat().st_uid})
+            if p.exists():
+                cands.append({"path": str(p), "owner_uid": p.stat().st_uid})
         run_user = pathlib.Path("/run/user")
         if run_user.is_dir():
             for d in run_user.iterdir():
                 p = d / "docker.sock"
                 try:
-                    if p.exists(): cands.append({"path": str(p), "owner_uid": p.stat().st_uid})
-                except OSError: pass
+                    if p.exists():
+                        cands.append({"path": str(p), "owner_uid": p.stat().st_uid})
+                except OSError:
+                    pass
         return cands
 
     def collect_containers(self) -> None:
         self.inventory["containers"] = {"docker": self.collect_container_runtime("docker"), "podman": self.collect_container_runtime("podman")}
         if which("crictl"):
             r = self.run(["crictl", "ps", "-a", "-o", "json"], "crictl.ps", timeout=12)
-            try: self.inventory["containers"]["cri"] = json.loads(r["stdout"]) if r["ok"] else {"error": r["status"]}
-            except json.JSONDecodeError: self.inventory["containers"]["cri"] = {"raw": r["stdout"], "error": r["status"]}
+            try:
+                self.inventory["containers"]["cri"] = json.loads(r["stdout"]) if r["ok"] else {"error": r["status"]}
+            except json.JSONDecodeError:
+                self.inventory["containers"]["cri"] = {"raw": r["stdout"], "error": r["status"]}
         else:
             self.inventory["containers"]["cri"] = {"available": False}; self.mark("crictl", "unsupported", "crictl not found")
 
@@ -355,8 +488,10 @@ class Inspector:
         st["mountinfo"] = read_text("/proc/self/mountinfo", 1_000_000) or ""
         if which("lsblk"):
             r = self.run(["lsblk", "-J", "-o", "NAME,KNAME,TYPE,SIZE,FSTYPE,FSVER,LABEL,UUID,MOUNTPOINTS"], "storage.lsblk")
-            try: st["lsblk"] = json.loads(r["stdout"]) if r["ok"] else None
-            except json.JSONDecodeError: st["lsblk_raw"] = r["stdout"]
+            try:
+                st["lsblk"] = json.loads(r["stdout"]) if r["ok"] else None
+            except json.JSONDecodeError:
+                st["lsblk_raw"] = r["stdout"]
         self.inventory["storage"] = st
 
     def collect_packages(self) -> None:
@@ -378,11 +513,12 @@ class Inspector:
                                "meminfo": self._kv_file("/proc/meminfo"), "swaps": read_text("/proc/swaps", 100_000) or "", "pressure": {}}
         for name in ("cpu", "memory", "io"):
             txt = read_text(f"/proc/pressure/{name}", 100_000)
-            if txt is not None: res["pressure"][name] = txt
+            if txt is not None:
+                res["pressure"][name] = txt
         self.inventory["resources"] = res; self.mark("resources", "ok")
 
     def _kv_file(self, path: str) -> Dict[str, str]:
-        out = {}
+        out: Dict[str, str] = {}
         for line in (read_text(path, 200_000) or "").splitlines():
             if ":" in line:
                 k, v = line.split(":", 1); out[k] = v.strip()
@@ -393,18 +529,64 @@ class Inspector:
         for p in ["/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d"]:
             path = pathlib.Path(p)
             try:
-                if path.is_file(): sec["sshd_config_locations"].append({"path": p, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-                elif path.is_dir(): sec["sshd_config_locations"].append({"path": p, "files": sorted(x.name for x in path.glob("*.conf"))})
-            except PermissionError: sec["sshd_config_locations"].append({"path": p, "error": "permission_denied"})
+                if path.is_file():
+                    sec["sshd_config_locations"].append({"path": p, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+                elif path.is_dir():
+                    sec["sshd_config_locations"].append({"path": p, "files": sorted(x.name for x in path.glob("*.conf"))})
+            except PermissionError:
+                sec["sshd_config_locations"].append({"path": p, "error": "permission_denied"})
         try:
-            for u in pwd.getpwall(): sec["users"].append({"name": u.pw_name, "uid": u.pw_uid, "gid": u.pw_gid, "home": u.pw_dir, "shell": u.pw_shell})
-        except Exception as e: sec["users_error"] = str(e)
+            for u in pwd.getpwall():
+                sec["users"].append({"name": u.pw_name, "uid": u.pw_uid, "gid": u.pw_gid, "home": u.pw_dir, "shell": u.pw_shell})
+        except Exception as e:
+            sec["users_error"] = str(e)
         self.inventory["security_summary"] = sec; self.mark("security_summary", "ok")
+
+    def build_relationships(self) -> None:
+        procs = self.inventory.get("processes", [])
+        proc_by_pid = {p.get("pid"): p for p in procs}
+        listeners = self.inventory.get("sockets", {}).get("current_namespace", {}).get("parsed_tcp_udp", [])
+        services = self.inventory.get("systemd", {}).get("services", [])
+        svc_by_name = {s.get("unit"): dict(s) for s in services}
+        service_pids: Dict[str, List[int]] = {}
+        for p in procs:
+            svc = p.get("systemd_service")
+            if svc:
+                service_pids.setdefault(svc, []).append(p["pid"])
+        for name, svc in svc_by_name.items():
+            pids = sorted(set(service_pids.get(name, []) + ([svc["main_pid"]] if svc.get("main_pid") else [])))
+            svc["pids"] = pids
+            svc["processes"] = [{"pid": pid, "name": proc_by_pid.get(pid, {}).get("name"), "exe": proc_by_pid.get(pid, {}).get("exe")}
+                                for pid in pids if pid in proc_by_pid]
+            svc["listeners"] = []
+        unassigned = []
+        for listener in listeners:
+            matched = set()
+            for pid in listener.get("pids", []):
+                p = proc_by_pid.get(pid) or {}
+                if p.get("systemd_service"):
+                    matched.add(p["systemd_service"])
+            for svc_name in matched:
+                if svc_name in svc_by_name:
+                    svc_by_name[svc_name]["listeners"].append(listener)
+            if not matched:
+                unassigned.append(listener)
+        running = [s for s in svc_by_name.values() if s.get("active_state") == "active"]
+        enabled_inactive = [s for s in svc_by_name.values() if s.get("unit_file_state") == "enabled" and s.get("active_state") != "active"]
+        self.inventory["relationships"] = {
+            "services": sorted(svc_by_name.values(), key=lambda x: x.get("unit") or ""),
+            "running_services": sorted(running, key=lambda x: x.get("unit") or ""),
+            "enabled_inactive_services": sorted(enabled_inactive, key=lambda x: x.get("unit") or ""),
+            "unassigned_listeners": unassigned,
+        }
+        self.mark("relationships", "ok", f"services={len(svc_by_name)}, linked_processes={sum(len(v) for v in service_pids.values())}")
 
     def scan(self) -> Dict[str, Any]:
         for fn in (self.collect_system, self.collect_processes, self.collect_systemd, self.collect_cron, self.collect_sockets,
-                   self.collect_network, self.collect_containers, self.collect_storage, self.collect_packages, self.collect_resources, self.collect_security_summary):
+                   self.collect_network, self.collect_containers, self.collect_storage, self.collect_packages, self.collect_resources,
+                   self.collect_security_summary):
             fn()
+        self.build_relationships()
         self.inventory["coverage"] = self.coverage; self.inventory["summary"] = self.build_summary(); return self.inventory
 
     def build_summary(self) -> Dict[str, Any]:
@@ -413,55 +595,149 @@ class Inspector:
         docker = self.inventory.get("containers", {}).get("docker", {})
         running_docker = sum(1 for c in docker.get("containers", []) or [] if (c.get("State") or {}).get("Running"))
         statuses: Dict[str, int] = {}
-        for c in self.coverage: statuses[c["status"]] = statuses.get(c["status"], 0) + 1
+        for c in self.coverage:
+            statuses[c["status"]] = statuses.get(c["status"], 0) + 1
+        rel = self.inventory.get("relationships", {})
         return {"process_count": len(self.inventory.get("processes", [])), "listener_count_current_namespace": len(listeners),
                 "wildcard_listener_count": len(public), "docker_container_count": len(docker.get("containers", []) or []),
                 "docker_running_count": running_docker, "installed_package_count": self.inventory.get("packages", {}).get("count", 0),
+                "running_service_count": len(rel.get("running_services", [])),
+                "enabled_inactive_service_count": len(rel.get("enabled_inactive_services", [])),
+                "timer_count": len(self.inventory.get("systemd", {}).get("timers", [])),
+                "socket_unit_count": len(self.inventory.get("systemd", {}).get("sockets", [])),
                 "coverage_status_counts": statuses}
 
 
 def write_outputs(inv: Dict[str, Any], outdir: pathlib.Path) -> None:
-    outdir.mkdir(parents=True, exist_ok=True); os.chmod(outdir, 0o700)
+    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(outdir, 0o700)
+    except OSError:
+        pass
     for name, content in {"inventory.json": json.dumps(inv, indent=2, ensure_ascii=False),
                           "coverage.json": json.dumps(inv.get("coverage", []), indent=2, ensure_ascii=False),
                           "report.md": render_report(inv)}.items():
-        p = outdir / name; p.write_text(content, encoding="utf-8"); os.chmod(p, 0o600)
+        p = outdir / name; p.write_text(content, encoding="utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
 
 
 def render_report(inv: Dict[str, Any]) -> str:
     s, sysi = inv.get("summary", {}), inv.get("system", {})
+    rel = inv.get("relationships", {})
     lines = ["# VPS Inspector Report", "", f"- Collected at: `{inv.get('collected_at')}`", f"- Tool version: `{inv.get('tool', {}).get('version')}`",
              f"- Hostname: `{sysi.get('hostname')}`", f"- OS: `{(sysi.get('os_release') or {}).get('PRETTY_NAME') or sysi.get('platform')}`",
              f"- Kernel: `{sysi.get('kernel')}`", f"- Root scan: `{sysi.get('is_root')}`", "", "## Summary", "",
-             f"- Processes observed: **{s.get('process_count', 0)}**", f"- Listening TCP/UDP sockets in current netns: **{s.get('listener_count_current_namespace', 0)}**",
+             f"- Processes observed: **{s.get('process_count', 0)}**", f"- Running systemd services: **{s.get('running_service_count', 0)}**",
+             f"- Enabled but inactive services: **{s.get('enabled_inactive_service_count', 0)}**",
+             f"- Listening TCP/UDP sockets in current netns: **{s.get('listener_count_current_namespace', 0)}**",
              f"- Wildcard listeners (`0.0.0.0`, `::`, `*`): **{s.get('wildcard_listener_count', 0)}**",
+             f"- systemd timers observed: **{s.get('timer_count', 0)}**", f"- systemd socket units observed: **{s.get('socket_unit_count', 0)}**",
              f"- Docker containers: **{s.get('docker_container_count', 0)}** total / **{s.get('docker_running_count', 0)}** running",
-             f"- Installed packages observed: **{s.get('installed_package_count', 0)}**", "", "## Listening ports (current network namespace)", "",
-             "| Proto | State | Address | Port | Process |", "|---|---|---|---:|---|"]
+             f"- Installed packages observed: **{s.get('installed_package_count', 0)}**", "", "## Service relationships", ""]
+    running = rel.get("running_services", [])
+    if not running:
+        lines.append("No active systemd services were parsed.")
+    else:
+        for svc in running:
+            lines += [f"### `{svc.get('unit')}`", "", f"- Description: {md(svc.get('description') or '')}",
+                      f"- State: `{svc.get('active_state')}/{svc.get('sub_state')}`",
+                      f"- Startup: `{svc.get('unit_file_state') or 'unknown'}`"]
+            if svc.get("main_pid"):
+                lines.append(f"- Main PID: `{svc.get('main_pid')}`")
+            if svc.get("fragment_path"):
+                lines.append(f"- Unit file: `{svc.get('fragment_path')}`")
+            procs = svc.get("processes", [])
+            if procs:
+                lines.append("- Processes: " + ", ".join(f"PID {p.get('pid')} `{p.get('name') or ''}`" for p in procs[:20]))
+            listeners = svc.get("listeners", [])
+            if listeners:
+                lines.append("- Listeners:")
+                for x in listeners:
+                    lines.append(f"  - `{x.get('proto')} {x.get('address')}:{x.get('port')}`")
+            else:
+                lines.append("- Listeners: none observed in the current host network namespace")
+            lines.append("")
+    lines += ["## Enabled but currently inactive services", ""]
+    inactive = rel.get("enabled_inactive_services", [])
+    if inactive:
+        lines += ["| Service | State | Unit file |", "|---|---|---|"]
+        for svc in inactive:
+            lines.append(f"| `{svc.get('unit')}` | `{svc.get('active_state')}/{svc.get('sub_state')}` | `{svc.get('fragment_path') or ''}` |")
+    else:
+        lines.append("None observed.")
+    lines += ["", "## systemd timers", ""]
+    timers = inv.get("systemd", {}).get("timers", [])
+    if timers:
+        lines += ["| Timer | Activates | Raw schedule/status |", "|---|---|---|"]
+        for t in timers[:200]:
+            lines.append(f"| `{t.get('unit')}` | `{t.get('activates') or ''}` | {md(t.get('raw'))} |")
+    else:
+        lines.append("No systemd timers parsed.")
+    lines += ["", "## systemd socket activation", ""]
+    socks = inv.get("systemd", {}).get("sockets", [])
+    if socks:
+        lines += ["| Socket unit | Activates | Raw status |", "|---|---|---|"]
+        for x in socks[:200]:
+            lines.append(f"| `{x.get('unit')}` | `{x.get('activates') or ''}` | {md(x.get('raw'))} |")
+    else:
+        lines.append("No systemd socket units parsed.")
+    lines += ["", "## Cron / periodic directories", ""]
+    cron = inv.get("cron", [])
+    if not cron:
+        lines.append("No cron sources observed.")
+    else:
+        for item in cron:
+            if item.get("type") == "dir":
+                entries = item.get("entries", [])
+                lines.append(f"- `{item.get('path')}`: {', '.join(f'`{e}`' for e in entries) if entries else 'empty'}")
+            elif item.get("type") == "file":
+                lines.append(f"- `{item.get('path')}`: file present (size {item.get('size')} bytes; content not copied into report)")
+            else:
+                lines.append(f"- `{item.get('path')}`: `{item.get('error')}`")
+    lines += ["", "## Listening ports (current network namespace)", "", "| Proto | State | Address | Port | Process | Related service |", "|---|---|---|---:|---|---|"]
+    proc_by_pid = {p.get("pid"): p for p in inv.get("processes", [])}
     for x in inv.get("sockets", {}).get("current_namespace", {}).get("parsed_tcp_udp", [])[:500]:
-        proc = str(x.get("process") or "").replace("|", "\\|")
-        lines.append(f"| {x.get('proto','')} | {x.get('state','')} | `{x.get('address','')}` | {x.get('port') or ''} | `{proc[:160]}` |")
+        services = sorted({proc_by_pid.get(pid, {}).get("systemd_service") for pid in x.get("pids", []) if proc_by_pid.get(pid, {}).get("systemd_service")})
+        proc = md((x.get("process") or "")[:160])
+        lines.append(f"| {x.get('proto','')} | {x.get('state','')} | `{x.get('address','')}` | {x.get('port') or ''} | `{proc}` | `{', '.join(services)}` |")
+    unassigned = rel.get("unassigned_listeners", [])
+    if unassigned:
+        lines += ["", "### Listeners not mapped to a systemd service", ""]
+        for x in unassigned:
+            lines.append(f"- `{x.get('proto')} {x.get('address')}:{x.get('port')}` — `{md(x.get('process') or 'unknown process')}`")
     lines += ["", "## Network namespace coverage", ""]
-    for ns in inv.get("sockets", {}).get("network_namespaces", []): lines.append(f"- `{ns.get('namespace')}` via PID `{ns.get('representative_pid')}`: **{ns.get('status')}**")
+    for ns in inv.get("sockets", {}).get("network_namespaces", []):
+        lines.append(f"- `{ns.get('namespace')}` via PID `{ns.get('representative_pid')}`: **{ns.get('status')}**")
     lines += ["", "## Docker", ""]
     docker = inv.get("containers", {}).get("docker", {})
-    if not docker.get("available"): lines.append("Docker CLI not found.")
-    elif not docker.get("containers"): lines.append(f"Docker available; inspect status: `{docker.get('info_status')}`; no inspectable containers were returned.")
+    if not docker.get("available"):
+        lines.append("Docker CLI not found.")
+    elif not docker.get("containers"):
+        lines.append(f"Docker available; inspect status: `{docker.get('info_status')}`; no inspectable containers were returned.")
     else:
         for c in docker.get("containers", []):
             st, hc = c.get("State") or {}, c.get("HostConfig") or {}
             lines.append(f"- `{c.get('Name')}` — status `{st.get('Status')}`, network `{hc.get('NetworkMode')}`, restart `{(hc.get('RestartPolicy') or {}).get('Name')}`")
             ports = (c.get("NetworkSettings") or {}).get("Ports")
-            if ports: lines.append(f"  - Ports: `{json.dumps(ports, ensure_ascii=False)[:800]}`")
-            for m in (c.get("Mounts") or [])[:20]: lines.append(f"  - Mount: `{m.get('Source')}` -> `{m.get('Destination')}` ({m.get('Type')})")
-    lines += ["", "## systemd", "", "Raw unit, unit-file, socket and timer inventories are stored in `inventory.json`." if inv.get("systemd", {}).get("available") else "systemd/systemctl not available.",
-              "", "## Coverage / blind spots", ""]
+            if ports:
+                lines.append(f"  - Ports: `{json.dumps(ports, ensure_ascii=False)[:800]}`")
+            for m in (c.get("Mounts") or [])[:20]:
+                lines.append(f"  - Mount: `{m.get('Source')}` -> `{m.get('Destination')}` ({m.get('Type')})")
+    lines += ["", "## Coverage / blind spots", ""]
     bad = [x for x in inv.get("coverage", []) if x.get("status") != "ok"]
-    if not bad: lines.append("All implemented collectors completed successfully. This is not proof that the host contains no hidden or kernel-level activity.")
+    if not bad:
+        lines.append("All implemented collectors completed successfully. This is not proof that the host contains no hidden or kernel-level activity.")
     else:
         for x in bad:
-            cmd = f" — `{x.get('command')}`" if x.get("command") else ""; lines.append(f"- **{x.get('status')}** `{x.get('collector')}`: {x.get('detail','')}{cmd}")
-    lines += ["", "## Interpretation notes", "", "- This tool reports observable host state and configured startup sources. It does not claim to defeat a malicious kernel/rootkit.",
+            cmd = f" — `{x.get('command')}`" if x.get("command") else ""
+            lines.append(f"- **{x.get('status')}** `{x.get('collector')}`: {x.get('detail','')}{cmd}")
+    lines += ["", "## Interpretation notes", "",
+              "- Service relationships are best-effort correlations based primarily on process cgroups, PIDs and socket ownership.",
+              "- An enabled but inactive service may start later or at boot; a timer or socket unit may activate services on demand.",
+              "- This tool reports observable host state and configured startup sources. It does not claim to defeat a malicious kernel/rootkit.",
               "- `EXPOSE` inside a container image is not treated as a host port reservation; published bindings and actual sockets matter more.",
               "- Cloud firewalls, load balancers, DNS and external tunnels are outside local-host certainty unless separately verified.",
               "- A stopped container or enabled service can still create a future conflict after reboot/restart, so inspect configured state as well as current listeners.", ""]
@@ -469,8 +745,10 @@ def render_report(inv: Dict[str, Any]) -> str:
 
 
 def normalize_for_diff(obj: Any) -> Any:
-    if isinstance(obj, dict): return {k: normalize_for_diff(v) for k, v in sorted(obj.items()) if k not in {"collected_at", "coverage"}}
-    if isinstance(obj, list): return [normalize_for_diff(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: normalize_for_diff(v) for k, v in sorted(obj.items()) if k not in {"collected_at", "coverage"}}
+    if isinstance(obj, list):
+        return [normalize_for_diff(x) for x in obj]
     return obj
 
 
@@ -478,24 +756,29 @@ def cmd_diff(a: pathlib.Path, b: pathlib.Path, output: Optional[pathlib.Path]) -
     ja, jb = normalize_for_diff(read_json_file(a)), normalize_for_diff(read_json_file(b))
     ta = json.dumps(ja, indent=2, ensure_ascii=False, sort_keys=True).splitlines(); tb = json.dumps(jb, indent=2, ensure_ascii=False, sort_keys=True).splitlines()
     diff = "\n".join(difflib.unified_diff(ta, tb, fromfile=str(a), tofile=str(b), lineterm=""))
-    if output: output.write_text(diff + ("\n" if diff else ""), encoding="utf-8")
-    else: print(diff or "No differences found.")
+    if output:
+        output.write_text(diff + ("\n" if diff else ""), encoding="utf-8")
+    else:
+        print(diff or "No differences found.")
     return 1 if diff else 0
 
 
 def iter_bindings(inv: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     for x in inv.get("sockets", {}).get("current_namespace", {}).get("parsed_tcp_udp", []):
-        if x.get("port"): yield {"source": "socket", "protocol": x.get("proto", "tcp").lower(), "address": x.get("address") or "*", "port": x.get("port"), "detail": x.get("process")}
+        if x.get("port"):
+            yield {"source": "socket", "protocol": x.get("proto", "tcp").lower(), "address": x.get("address") or "*", "port": x.get("port"), "detail": x.get("process")}
     for c in inv.get("containers", {}).get("docker", {}).get("containers", []) or []:
         for container_port, vals in ((c.get("HostConfig") or {}).get("PortBindings") or {}).items():
             proto = container_port.split("/")[-1] if "/" in container_port else "tcp"
             for v in vals or []:
                 hp = v.get("HostPort")
-                if hp and str(hp).isdigit(): yield {"source": "docker", "protocol": proto, "address": v.get("HostIp") or "0.0.0.0", "port": int(hp), "detail": c.get("Name")}
+                if hp and str(hp).isdigit():
+                    yield {"source": "docker", "protocol": proto, "address": v.get("HostIp") or "0.0.0.0", "port": int(hp), "detail": c.get("Name")}
 
 
 def address_conflicts(a: str, b: str) -> bool:
-    wild = {"", "*", "0.0.0.0", "::", "[::]"}; return a in wild or b in wild or a == b
+    wild = {"", "*", "0.0.0.0", "::", "[::]"}
+    return a in wild or b in wild or a == b
 
 
 def cmd_check(snapshot: pathlib.Path, plan: pathlib.Path) -> int:
@@ -510,19 +793,24 @@ def cmd_check(snapshot: pathlib.Path, plan: pathlib.Path) -> int:
             if hproto == wproto and have.get("port") == wp and address_conflicts(str(have.get("address", "*")), waddr):
                 findings.append({"type": "port_conflict", "severity": "high", "wanted": want, "existing": have})
     for path in p.get("data_paths", []):
-        if pathlib.Path(path).exists(): findings.append({"type": "path_exists", "severity": "medium", "path": path, "detail": "Path already exists on the machine running check; review ownership/content before deployment."})
+        if pathlib.Path(path).exists():
+            findings.append({"type": "path_exists", "severity": "medium", "path": path,
+                             "detail": "Path already exists on the machine running check; review ownership/content before deployment."})
         for c in inv.get("containers", {}).get("docker", {}).get("containers", []) or []:
             for m in c.get("Mounts") or []:
                 src = m.get("Source")
                 if src and (path == src or path.startswith(src.rstrip("/") + "/") or src.startswith(path.rstrip("/") + "/")):
-                    findings.append({"type": "docker_mount_overlap", "severity": "high", "path": path, "existing": {"container": c.get("Name"), "mount": m}})
+                    findings.append({"type": "docker_mount_overlap", "severity": "high", "path": path,
+                                     "existing": {"container": c.get("Name"), "mount": m}})
     print(json.dumps({"plan": p.get("name"), "checked_snapshot": str(snapshot), "findings": findings,
-                      "coverage_warning": "No conflict found means only no conflict was observed within this snapshot's checked scope."}, indent=2, ensure_ascii=False))
+                      "coverage_warning": "No conflict found means only no conflict was observed within this snapshot's checked scope."},
+                     indent=2, ensure_ascii=False))
     return 2 if any(x.get("severity") == "high" for x in findings) else (1 if findings else 0)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Read-only VPS inventory and deployment conflict preflight"); p.add_argument("--version", action="version", version=f"vps-inspector {VERSION}")
+    p = argparse.ArgumentParser(description="Read-only VPS inventory, service relationships and deployment conflict preflight")
+    p.add_argument("--version", action="version", version=f"vps-inspector {VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("scan", help="Collect a VPS snapshot"); s.add_argument("-o", "--output", default=None); s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT); s.add_argument("--strict", action="store_true")
     d = sub.add_parser("diff", help="Compare two inventory.json snapshots"); d.add_argument("before"); d.add_argument("after"); d.add_argument("-o", "--output", default=None)
@@ -537,8 +825,10 @@ def main() -> int:
         inv = Inspector(timeout=max(1, args.timeout), strict=args.strict).scan(); write_outputs(inv, out)
         print(f"VPS Inspector {VERSION} completed\nReport:    {out / 'report.md'}\nInventory: {out / 'inventory.json'}\nCoverage:  {out / 'coverage.json'}")
         print("Tip: run with sudo/root for broader process, namespace, firewall and container visibility."); return 0
-    if args.command == "diff": return cmd_diff(pathlib.Path(args.before), pathlib.Path(args.after), pathlib.Path(args.output) if args.output else None)
-    if args.command == "check": return cmd_check(pathlib.Path(args.snapshot), pathlib.Path(args.plan))
+    if args.command == "diff":
+        return cmd_diff(pathlib.Path(args.before), pathlib.Path(args.after), pathlib.Path(args.output) if args.output else None)
+    if args.command == "check":
+        return cmd_check(pathlib.Path(args.snapshot), pathlib.Path(args.plan))
     return 2
 
 
