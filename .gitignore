@@ -1,7 +1,5 @@
-vps-inspector-output/
-vps-scan-*/
-before/
-after/
 __pycache__/
 *.pyc
-diff.txt
+vps-inspector-*/
+*.diff
+.DS_Store
