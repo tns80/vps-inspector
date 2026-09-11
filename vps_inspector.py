@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""VPS Inspector v0.3.0 - read-only Linux VPS inventory and deployment preflight."""
+"""VPS Inspector v0.3.1 - read-only Linux VPS inventory and deployment preflight."""
 from __future__ import annotations
 import argparse, datetime as dt, difflib, hashlib, ipaddress, json, os, pathlib, platform, pwd, re, shutil, socket, subprocess
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION="0.3.0"; SCHEMA_VERSION=4; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
+VERSION="0.3.1"; SCHEMA_VERSION=5; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
 SENSITIVE=[re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)=([^\s]+)"),re.compile(r"(?i)(--password|--passwd|--token|--secret|--api-key)\s+([^\s]+)")]
 SVC_RE=re.compile(r"(?:^|/)([^/]+\.service)(?:/|$)"); PID_RE=re.compile(r"pid=(\d+)"); PROC_RE=re.compile(r'users:\(\(\"([^\"]+)\"')
 
@@ -28,7 +28,9 @@ def scope(addr):
     try:
         ip=ipaddress.ip_address(z)
         if ip.is_loopback:return "loopback"
+        if ip.version==4 and ip in ipaddress.ip_network("100.64.0.0/10"):return "shared/overlay"
         if ip.is_private:return "private/overlay"
+        if not ip.is_global:return "special/non-global"
         return "specific/public"
     except ValueError:return "specific"
 
@@ -164,7 +166,7 @@ class Inspector:
         self.inv["cron"]={"files":files,"jobs":jobs,"periodic":periodic};self.mark("cron","ok",f"jobs={len(jobs)}")
     def sockets(self):
         if not which("ss"):self.inv["sockets"]={};self.mark("sockets","unsupported");return
-        cur=self.run(["ss","-H","-lntup"],"sockets.host");out={"current_namespace":{"parsed_tcp_udp":parse_ss(cur["stdout"])},"network_namespaces":[]};ns={}
+        cur=self.run(["ss","-H","-lntup"],"sockets.host");out={"current_namespace":{"parsed_tcp_udp":parse_ss(cur["stdout"])} ,"network_namespaces":[]};ns={}
         for n in os.listdir("/proc"):
             if n.isdigit():
                 try:ns.setdefault(os.readlink(f"/proc/{n}/ns/net"),[]).append(int(n))
@@ -287,10 +289,15 @@ class Inspector:
         dports=[];dns={}
         for c in self.inv.get("containers",{}).get("docker",{}).get("containers",[]):
             if c.get("netns"):dns[c["netns"]]=c["Name"]
-            for cp,vals in (c.get("HostConfig",{}).get("PortBindings") or {}).items():
-                for v in vals or []:
-                    hp=str(v.get("HostPort") or "")
-                    if hp.isdigit():dports.append({"proto":proto(cp.split("/")[-1]),"port":int(hp),"address":v.get("HostIp") or "0.0.0.0","container":c["Name"]})
+            seen_bindings=set()
+            for source in ((c.get("HostConfig",{}).get("PortBindings") or {}),(c.get("NetworkSettings",{}).get("Ports") or {})):
+                for cp,vals in source.items():
+                    for v in vals or []:
+                        hp=str(v.get("HostPort") or "")
+                        if not hp.isdigit():continue
+                        item=(proto(cp.split("/")[-1]),int(hp),str(v.get("HostIp") or "0.0.0.0"),c["Name"])
+                        if item in seen_bindings:continue
+                        seen_bindings.add(item);dports.append({"proto":item[0],"port":item[1],"address":item[2],"container":item[3]})
         listeners=[];v6=str(self.inv.get("network",{}).get("bindv6only") or "0")
         for x in self.inv.get("sockets",{}).get("current_namespace",{}).get("parsed_tcp_udp",[]):
             y=dict(x);owners=sorted({pb.get(i,{}).get("systemd_service") for i in x.get("pids",[]) if pb.get(i,{}).get("systemd_service")});y["systemd_services"]=owners
@@ -308,7 +315,8 @@ class Inspector:
         hostns=self.inv.get("system",{}).get("host_netns");nss=[]
         for x in self.inv.get("sockets",{}).get("network_namespaces",[]):
             y=dict(x);y["kind"]="host" if x.get("namespace")==hostns else ("docker" if x.get("namespace") in dns else "other");y["docker_container"]=dns.get(x.get("namespace"));nss.append(y)
-        vals=list(svcs.values());self.inv["relationships"]={"services":vals,"running_services":[x for x in vals if x.get("active_state")=="active" and x.get("sub_state")=="running"],"active_exited_services":[x for x in vals if x.get("active_state")=="active" and x.get("sub_state")=="exited"],"enabled_inactive_services":[x for x in vals if x.get("unit_file_state") in {"enabled","enabled-runtime"} and x.get("active_state")!="active"],"listeners":listeners,"network_namespaces":nss}
+        unmanaged=[p for p in procs if p.get("netns")==hostns and not p.get("systemd_service") and p.get("pid",0)>1 and p.get("cmdline")]
+        vals=list(svcs.values());self.inv["relationships"]={"services":vals,"running_services":[x for x in vals if x.get("active_state")=="active" and x.get("sub_state")=="running"],"active_exited_services":[x for x in vals if x.get("active_state")=="active" and x.get("sub_state")=="exited"],"enabled_inactive_services":[x for x in vals if x.get("unit_file_state") in {"enabled","enabled-runtime"} and x.get("active_state")!="active"],"listeners":listeners,"network_namespaces":nss,"unmanaged_host_processes":unmanaged}
     def scan(self):
         for fn in (self.system,self.processes,self.systemd,self.cron,self.sockets,self.network,self.containers,self.user_systemd,self.misc):fn()
         self.relationships();r=self.inv["relationships"];d=self.inv["containers"]["docker"];self.inv["summary"]={"process_count":len(self.inv["processes"]),"running_service_count":len(r["running_services"]),"active_exited_service_count":len(r["active_exited_services"]),"enabled_inactive_service_count":len(r["enabled_inactive_services"]),"listener_count":len(r["listeners"]),"wildcard_count":sum(x.get("scope")=="wildcard" for x in r["listeners"]),"netns_count":len(r["network_namespaces"]),"docker_count":len(d.get("containers",[])),"docker_running":sum(bool(c.get("State",{}).get("Running")) for c in d.get("containers",[])),"timer_count":len(self.inv.get("systemd",{}).get("timers",[])),"socket_count":len(self.inv.get("systemd",{}).get("sockets",[])),"cron_count":len(self.inv["cron"]["jobs"]),"package_count":self.inv["packages"]["count"]};self.inv["coverage"]=self.coverage;return self.inv
@@ -342,12 +350,24 @@ def render(inv):
     L += ["","## Firewall / NAT summary",""]
     if fw.get("interesting_rules"):L += ["```text",*fw["interesting_rules"][:200],"```"]
     else:L.append("No matching local firewall/NAT rules captured.")
+    L += ["","## Host processes not attributed to a systemd service",""]
+    unmanaged=r.get("unmanaged_host_processes",[])
+    if unmanaged:
+        L += ["| PID | User | Process | Command |","|---:|---|---|---|"]
+        for p in unmanaged[:100]:L.append(f"| {p.get('pid')} | `{md(p.get('user'))}` | `{md(p.get('name'))}` | `{md((p.get('cmdline') or '')[:300])}` |")
+    else:L.append("None observed.")
     L += ["","## User systemd discovery",""]
-    for x in inv.get("user_systemd",{}).get("runtime_users",[]):L.append(f"- `{x.get('user')}` uid={x.get('uid')}: `{x.get('status')}`, services={len(x.get('services',[]))}")
+    for x in inv.get("user_systemd",{}).get("runtime_users",[]):
+        L.append(f"### `{x.get('user')}` uid={x.get('uid')} — `{x.get('status')}`")
+        shown=[u for u in x.get('services',[]) if u.get('active_state')=='active' or u.get('unit_file_state') in {'enabled','enabled-runtime'}]
+        if shown:
+            L += ["| Unit | State | Startup | PID |","|---|---|---|---:|"]
+            for u in shown[:100]:L.append(f"| `{md(u.get('unit'))}` | `{md(u.get('active_state'))}/{md(u.get('sub_state'))}` | `{md(u.get('unit_file_state') or 'unknown')}` | {u.get('main_pid') or ''} |")
+        else:L.append("No active/enabled user services observed.")
     L += ["","## Coverage / blind spots",""]
     bad=[x for x in inv.get("coverage",[]) if x.get("status")!="ok"]
     L += [f"- **{x.get('status')}** `{x.get('collector')}`: {md(x.get('detail'))}" for x in bad] or ["All implemented collectors completed successfully."]
-    L += ["","## Notes","","- Container declared ports are not host reservations; published ports and actual per-netns listeners are shown separately.","- `effective_startup=socket-activated` means a disabled service can still start through an enabled socket.","- Local firewall summaries do not include cloud firewalls, external load balancers, DNS, or remote tunnel control planes.","- Same-host tools cannot prove absence of kernel/rootkit concealment.",""];return "\n".join(L)
+    L += ["","## Notes","","- Container declared ports are not host reservations; published ports and actual per-netns listeners are shown separately.","- `effective_startup=socket-activated` means a disabled service can still start through an enabled socket.","- `shared/overlay` includes RFC 6598 shared address space such as Tailscale 100.64.0.0/10; it is not classified as public Internet space.","- Local firewall summaries do not include cloud firewalls, external load balancers, DNS, or remote tunnel control planes.","- Same-host tools cannot prove absence of kernel/rootkit concealment.",""];return "\n".join(L)
 
 def write_outputs(inv,out):
     out.mkdir(parents=True,exist_ok=True)
