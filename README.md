@@ -1,25 +1,30 @@
 # VPS Inspector
 
-一个以 **只读盘点 + 服务关系分析 + 部署冲突预检** 为目标的 Linux VPS 环境检查工具。
+一个面向 Linux VPS 的**只读环境盘点 + 服务关系分析 + 部署冲突预检**工具。
 
-VPS Inspector 不依赖固定的“已知服务名称列表”，而是尽量从 `/proc`、systemd、socket、network namespace、容器运行时、网络、存储和包管理器等事实出发。遇到权限不足、命令缺失或无法检查的范围，会明确写入 `coverage.json`，不会把“没看到”误判成“没有”。
+VPS Inspector 尽量从 `/proc`、systemd、socket、network namespace、容器运行时、网络、防火墙、存储、cron 和包管理器等可观察事实出发，而不是依赖固定的“已知服务名称列表”。检查不到的范围会写入 `coverage.json`，不会把“没看到”误判成“没有”。
 
-## v0.2.0 新增
+## v0.3.0
 
-v0.2.0 在 v0.1 采集层基础上增加 **服务关系报告**：
+v0.3.0 在 v0.2.1 基础上完成了一轮源码审计和回归修复，重点增加：
 
-- 结构化解析 systemd service 状态
-- 区分正在运行的 service 与 enabled-but-inactive service
-- 展示 systemd timer 和 socket activation
-- 从进程 cgroup 识别所属 systemd service
-- 从 `ss` 提取 socket PID / process name
-- 关联 `service -> PID -> socket/port`
-- 把 cron/周期目录直接写入 `report.md`
-- 把未能关联到 systemd service 的监听端口单独列出
-- `inventory.json` 新增 `relationships` 数据
-- 保留 `scan / diff / check` 三种模式
+- Deployment preflight summary：报告首页直接列出监听地址、端口、范围和归属
+- `host netns -> Docker container netns` 关联
+- 每个可检查 network namespace 的实际监听端口
+- 区分 Docker 容器声明端口、容器内部实际监听、宿主机 published port
+- Docker network/subnet 盘点
+- `check` 支持 `network_cidrs` 与 Docker subnet 重叠检查
+- Docker published port 按 HostIp + protocol + port 关联，避免只按端口号误归属
+- 运行中 Docker published port 不再与实际 socket 重复报冲突；停止容器的未来端口占用仍保留
+- IPv4/IPv6 wildcard 冲突判断参考 `net.ipv6.bindv6only`
+- systemd effective startup：识别 enabled、socket-activated、static/dependency 等情况
+- 多用户 systemd unit 目录发现；有用户 bus 时尝试只读查询 `systemctl --user`
+- cron 实际任务解析，并对常见 secret-like 参数做脱敏
+- nftables/iptables 关键规则摘要
+- 恢复并保留 Podman、CRI、lsblk/mount、PSI、SSH/用户概要等 v0.2 采集能力
+- 修复 Markdown 表格中的换行和 `|` 导致的错位
 
-## 更新到 v0.2.0
+## 更新并扫描
 
 已经 clone 过仓库：
 
@@ -32,84 +37,139 @@ python3 vps_inspector.py --version
 应输出：
 
 ```text
-vps-inspector 0.2.0
+vps-inspector 0.3.0
 ```
 
-重新扫描：
+建议新建快照，不覆盖 v0.2：
 
 ```bash
-rm -rf /root/vps-snapshot-v02
-python3 vps_inspector.py scan -o /root/vps-snapshot-v02
-cat /root/vps-snapshot-v02/report.md
+rm -rf /root/vps-snapshot-v03
+python3 vps_inspector.py scan -o /root/vps-snapshot-v03
+cat /root/vps-snapshot-v03/report.md
 ```
 
-如果当前已经是 root 登录，不需要再写 `sudo`。
+如果已经是 root 登录，不需要 `sudo`。
 
-## 输出文件
+输出：
 
 ```text
-/root/vps-snapshot-v02/
-├── report.md       # 给人看的服务关系和环境摘要
-├── inventory.json  # 完整结构化盘点结果
-└── coverage.json   # 每个采集器的覆盖状态
+/root/vps-snapshot-v03/
+├── report.md
+├── inventory.json
+└── coverage.json
 ```
 
-### v0.2 report.md 重点内容
+`report.md` 给人阅读；`inventory.json` 是完整结构化事实；`coverage.json` 用来判断哪些检查完整、失败、超时、缺工具或权限不足。
+
+## v0.3 报告重点
+
+报告会优先展示：
 
 ```text
-Summary
-Service relationships
-Enabled but currently inactive services
-systemd timers
-systemd socket activation
-Cron / periodic directories
-Listening ports + Related service
-Listeners not mapped to a systemd service
-Network namespace coverage
+Deployment preflight summary
+Long-running service relationships
+Network namespaces and containers
 Docker
+Docker networks
+systemd socket activation
+Cron jobs
+Firewall / NAT summary
+User systemd discovery
 Coverage / blind spots
 ```
 
-理想关联效果：
+例如：
 
 ```text
-22/tcp
-  -> PID 7901 sshd
-  -> ssh.service
-  -> active/running
-  -> enabled
+0.0.0.0:8443/tcp
+  -> docker-proxy
+  -> docker.service
+  -> Docker: game-image-api-gateway-1
+
+container netns
+  -> game-image-api-api-1
+  -> actual internal listeners
 ```
 
-## 安全设计
+注意：Docker 的 `EXPOSE`/声明端口不是宿主机端口占用。v0.3 会尽量把以下三类分开：
 
-`scan` 默认不会：
+```text
+Declared container port
+Actual listener inside container namespace
+Host-published port
+```
 
-- 安装或卸载软件
-- 升级系统
-- start/stop/restart 服务
-- 修改 firewall / sysctl
-- 删除容器、镜像或 volume
-- 修改现有配置
+## 新服务部署冲突预检
 
-它只会创建指定的报告目录。`inventory.json` 可能包含 hostname、IP、路径、包版本、进程参数和容器 metadata。脚本进行基础 secret-like 参数脱敏，但分享扫描结果前仍应人工检查。
+复制示例：
+
+```bash
+cp deployment-plan.example.json my-service.json
+nano my-service.json
+```
+
+示例：
+
+```json
+{
+  "name": "new-service",
+  "deployment": "docker",
+  "network_mode": "bridge",
+  "host_bindings": [
+    {
+      "address": "127.0.0.1",
+      "port": 8080,
+      "protocol": "tcp"
+    }
+  ],
+  "network_cidrs": [
+    "172.30.0.0/16"
+  ],
+  "data_paths": [
+    "/srv/new-service/data"
+  ],
+  "domains": [
+    "app.example.com"
+  ],
+  "memory_budget_mb": 512
+}
+```
+
+运行：
+
+```bash
+python3 vps_inspector.py check \
+  /root/vps-snapshot-v03/inventory.json \
+  my-service.json
+```
+
+v0.3 当前检查：
+
+- 当前实际 TCP/UDP host socket 冲突
+- Docker published port 冲突
+- 已停止 Docker 容器配置的未来 published port 冲突
+- IPv4/IPv6 wildcard 地址占用关系
+- Docker bind mount 与计划数据目录重叠
+- 计划数据目录已存在
+- 计划 `network_cidrs` 与 Docker network subnet 重叠
+
+返回码：
+
+```text
+0 = 当前检查范围内未发现冲突
+1 = 有非高危发现
+2 = 有高危冲突
+```
+
+“未发现冲突”只表示当前 snapshot 和已实现规则范围内没有发现冲突，不代表外部云防火墙、负载均衡、DNS、远端 tunnel 控制面或未来状态一定没有影响。
 
 ## 系统升级前后对比
 
-升级前：
-
 ```bash
 python3 vps_inspector.py scan -o /root/vps-before
-```
-
-升级、重启后：
-
-```bash
+# 手动升级 / 重启
 python3 vps_inspector.py scan -o /root/vps-after
-```
 
-对比：
-
-```bash
 python3 vps_inspector.py diff \
   /root/vps-before/inventory.json \
   /root/vps-after/inventory.json \
@@ -118,46 +178,32 @@ python3 vps_inspector.py diff \
 less /root/vps-upgrade.diff
 ```
 
-`diff` 返回码：`0` 无差异，`1` 有差异。
-
-## 新服务部署冲突预检
-
-```bash
-cp deployment-plan.example.json my-service.json
-nano my-service.json
-
-python3 vps_inspector.py check \
-  /root/vps-snapshot-v02/inventory.json \
-  my-service.json
-```
-
-当前会检查：
-
-- 当前实际 TCP/UDP 监听端口冲突
-- Docker published port 冲突
-- 已停止 Docker 容器仍配置的 published port 冲突
-- Docker bind mount 与计划数据目录重叠
-- 计划数据目录已经存在
-
-`check` 返回码：`0` 未发现冲突，`1` 有非高危发现，`2` 有高危冲突。
-
-“未发现冲突”只代表当前 snapshot 已检查范围内没有发现，不代表端口永久可用。
+`diff` 返回 `0` 表示没有差异，`1` 表示检测到差异。
 
 ## 主要采集范围
 
-- 系统：发行版、内核、架构、虚拟化、init、uptime
-- 进程：PID、PPID、用户、exe、cwd、cmdline、cgroup、netns、systemd service
-- systemd：service、unit file、timer、socket activation
-- cron：系统 cron 文件/周期目录清单
-- 网络：TCP/UDP/Unix socket、namespace、地址、路由、policy rule、forwarding、nftables/iptables
-- Docker：运行/停止容器、端口映射、mount、restart policy、network、volume
-- Podman / CRI：存在时盘点
-- 存储：filesystem、mount、inode、block device
-- 软件包：dpkg/rpm、APT hold
-- 资源：CPU/load/memory/swap/PSI
-- SSH / 用户概要
+- 系统：发行版、内核、架构、虚拟化、init、uptime、boot id
+- 进程：PID、PPID、用户、exe、cmdline、cgroup、netns、systemd service
+- systemd：service、unit file 状态、socket activation、timer、effective startup
+- user systemd：系统/用户 unit 目录；存在 user bus 时尝试查询运行态
+- cron：`/etc/crontab`、`/etc/cron.d`、用户 crontab、周期目录
+- socket：TCP/UDP 监听、PID、进程名、network namespace
+- 网络：地址、路由、policy rule、forwarding、bindv6only、DNS、临时/保留端口范围
+- 防火墙：nftables 或 iptables 关键规则摘要
+- Docker：运行/停止容器、published port、mount、restart policy、network、subnet、container netns
+- Podman / CRI：工具存在时尝试盘点
+- 存储：df、inode、mountinfo、lsblk
+- 软件包：dpkg/rpm/apk
+- 资源：CPU、load、memory、swap、Linux PSI
+- SSH / 用户：配置位置/哈希与 passwd 用户概要，不读取密码哈希或私钥
 
-## Coverage 状态
+## 安全与覆盖原则
+
+`scan` 默认不会安装、升级、删除、restart/stop/start 服务，不会修改 firewall/sysctl，也不会修改容器。它只写指定的报告目录。
+
+`inventory.json` 可能包含 hostname、IP、文件路径、包版本、进程命令行和容器 metadata。脚本对常见 password/token/secret 参数做基础脱敏，但分享报告前仍建议人工检查。
+
+Coverage 状态可能包括：
 
 ```text
 ok
@@ -168,27 +214,12 @@ timeout
 error
 ```
 
-检查不到就明确报告，不会自动显示“正常”。
+建议使用 root 扫描以获得更完整的 `/proc`、namespace、防火墙和容器可见性。
+
+同一台 VPS 内的工具无法证明恶意 kernel/rootkit、不可信系统工具或被篡改内核接口不存在；云厂商 Security Group、外部 Load Balancer、DNS 和远端 tunnel 控制面也不属于本地扫描可以完全确认的范围。
 
 ## 依赖
 
 必须：Linux、Python 3.8+。
 
-推荐存在：`ss`、`ip`、`systemctl`、`nsenter`、`nft`、`lsblk`。Docker/Podman/crictl 只在相应运行时存在时使用，缺失不会自动安装。
-
-## 关于“不会遗漏”
-
-同一台 VPS 内运行的脚本无法对恶意 kernel/rootkit、被篡改的系统工具，以及 VPS 外部的 cloud firewall、load balancer、DNS、外部 tunnel 控制面做绝对保证。
-
-项目目标是：**不因为“不认识某个新服务”就漏掉可观察对象；尽量从进程、socket、namespace、容器和启动机制发现它，并明确告诉你哪些范围没有检查成功。**
-
-## v0.3 后续方向
-
-- rootless Docker / Podman 多用户运行时枚举
-- nginx / Caddy / Traefik domain/upstream 关联
-- Cloudflare Tunnel 等 tunnel client 识别
-- Docker Compose project 关联
-- 网络段/容器 subnet 冲突检查
-- APT/DNF 升级模拟与 restart/reboot 风险
-- 语义化 snapshot diff
-- 可选 transient event 观察模式
+推荐存在：`ss`、`ip`、`systemctl`、`nsenter`、`nft`/`iptables-save`、`lsblk`、`runuser`。Docker/Podman/crictl 只在相应环境存在时使用，缺失不会自动安装。
