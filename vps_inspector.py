@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""VPS Inspector v0.3.1 - read-only Linux VPS inventory and deployment preflight."""
+"""VPS Inspector v0.3.2 - read-only Linux VPS inventory and deployment preflight."""
 from __future__ import annotations
 import argparse, datetime as dt, difflib, hashlib, ipaddress, json, os, pathlib, platform, pwd, re, shutil, socket, subprocess
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION="0.3.1"; SCHEMA_VERSION=5; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
+VERSION="0.3.2"; SCHEMA_VERSION=6; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
 SENSITIVE=[re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)=([^\s]+)"),re.compile(r"(?i)(--password|--passwd|--token|--secret|--api-key)\s+([^\s]+)")]
 SVC_RE=re.compile(r"(?:^|/)([^/]+\.service)(?:/|$)"); PID_RE=re.compile(r"pid=(\d+)"); PROC_RE=re.compile(r'users:\(\(\"([^\"]+)\"')
 
@@ -53,16 +53,17 @@ def parse_ss(text):
 
 class Inspector:
     def __init__(self,timeout=DEFAULT_TIMEOUT):
-        self.timeout=timeout; self.coverage=[]; self.inv={"schema_version":SCHEMA_VERSION,"tool":{"name":"vps-inspector","version":VERSION},"collected_at":now()}
+        self.timeout=timeout; self.self_pid=os.getpid(); self.coverage=[]; self.inv={"schema_version":SCHEMA_VERSION,"tool":{"name":"vps-inspector","version":VERSION},"collected_at":now(),"scanner":{"self_process_excluded":True}}
     def mark(self,name,status,detail="",**kw): self.coverage.append({"collector":name,"status":status,"detail":detail,**kw})
     def run(self,cmd,name,timeout=None,env=None):
         if not which(cmd[0]): self.mark(name,"unsupported",f"command not found: {cmd[0]}"); return {"ok":False,"status":"unsupported","stdout":"","stderr":""}
         e={"PATH":os.environ.get("PATH","/usr/sbin:/usr/bin:/sbin:/bin"),"LANG":"C","LC_ALL":"C"}; e.update(env or {})
         try:
             p=subprocess.run(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors="replace",timeout=timeout or self.timeout,env=e,check=False)
-            st="ok" if p.returncode==0 else ("permission_denied" if any(x in p.stderr.lower() for x in ("permission denied","operation not permitted")) else "error")
-            self.mark(name,st,f"exit={p.returncode}",command=" ".join(cmd),truncated=len(p.stdout)>MAX_OUTPUT or len(p.stderr)>MAX_OUTPUT)
-            return {"ok":p.returncode==0,"status":st,"stdout":p.stdout[:MAX_OUTPUT],"stderr":p.stderr[:MAX_OUTPUT]}
+            truncated=len(p.stdout)>MAX_OUTPUT or len(p.stderr)>MAX_OUTPUT
+            st=("partial" if truncated else "ok") if p.returncode==0 else ("permission_denied" if any(x in p.stderr.lower() for x in ("permission denied","operation not permitted")) else "error")
+            self.mark(name,st,f"exit={p.returncode}"+("; output truncated" if truncated else ""),command=" ".join(cmd),truncated=truncated)
+            return {"ok":p.returncode==0,"status":st,"stdout":p.stdout[:MAX_OUTPUT],"stderr":p.stderr[:MAX_OUTPUT],"truncated":truncated}
         except subprocess.TimeoutExpired:self.mark(name,"timeout",f"timeout after {timeout or self.timeout}s"); return {"ok":False,"status":"timeout","stdout":"","stderr":""}
         except Exception as ex:self.mark(name,"error",f"{type(ex).__name__}: {ex}"); return {"ok":False,"status":"error","stdout":"","stderr":str(ex)}
     def system(self):
@@ -78,10 +79,13 @@ class Inspector:
         except (ValueError,IndexError):uptime=None
         self.inv["system"]={"hostname":socket.gethostname(),"fqdn":socket.getfqdn(),"platform":platform.platform(),"kernel":platform.release(),"architecture":platform.machine(),"python":platform.python_version(),"uid":os.geteuid(),"is_root":os.geteuid()==0,"os_release":o,"host_netns":ns,"virtualization":virt,"init":init,"uptime_seconds":uptime,"boot_id":(read("/proc/sys/kernel/random/boot_id",10000) or "").strip()};self.mark("system","ok")
     def processes(self):
-        rows=[];denied=0
+        rows=[];denied=0;scanner_excluded=0
         for n in os.listdir("/proc"):
             if not n.isdigit():continue
-            pid=int(n);base=f"/proc/{pid}"
+            pid=int(n)
+            if pid==self.self_pid:
+                scanner_excluded+=1;continue
+            base=f"/proc/{pid}"
             try:
                 d={}
                 for l in (read(base+"/status",50000) or "").splitlines():
@@ -91,15 +95,17 @@ class Inspector:
                 raw=pathlib.Path(base+"/cmdline").read_bytes()[:100000];cmd=redact(raw.replace(b"\0",b" ").decode("utf-8","replace").strip())
                 try:exe=os.readlink(base+"/exe")
                 except OSError:exe=None
+                try:cwd=os.readlink(base+"/cwd")
+                except OSError:cwd=None
                 try:netns=os.readlink(base+"/ns/net")
                 except OSError:netns=None
                 cg=read(base+"/cgroup",50000) or "";m=SVC_RE.findall(cg);uid=int(d.get("Uid","0").split()[0]) if d.get("Uid") else None
                 try:user=pwd.getpwuid(uid).pw_name if uid is not None else None
                 except KeyError:user=None
-                rows.append({"pid":pid,"ppid":int(d.get("PPid","0") or 0),"name":d.get("Name"),"uid":uid,"user":user,"exe":exe,"cmdline":cmd[:4000],"cgroup":cg[:4000],"systemd_service":m[-1] if m else None,"netns":netns})
+                rows.append({"pid":pid,"ppid":int(d.get("PPid","0") or 0),"name":d.get("Name"),"state":d.get("State"),"threads":d.get("Threads"),"nspid":d.get("NSpid"),"uid":uid,"user":user,"exe":exe,"cwd":cwd,"cmdline":cmd[:4000],"cgroup":cg[:4000],"systemd_service":m[-1] if m else None,"netns":netns})
             except PermissionError:denied+=1
             except (OSError,ValueError):continue
-        rows.sort(key=lambda x:x["pid"]);self.inv["processes"]=rows;self.mark("processes","partial" if denied else "ok",f"processes={len(rows)}, denied={denied}")
+        rows.sort(key=lambda x:x["pid"]);self.inv["processes"]=rows;self.inv["scanner"]["excluded_process_count"]=scanner_excluded;self.mark("processes","partial" if denied else "ok",f"processes={len(rows)}, denied={denied}, scanner_excluded={scanner_excluded}")
     def _blocks(self,text,suffix):
         out=[]
         for b in re.split(r"\n\s*\n",text.strip()):
@@ -166,7 +172,7 @@ class Inspector:
         self.inv["cron"]={"files":files,"jobs":jobs,"periodic":periodic};self.mark("cron","ok",f"jobs={len(jobs)}")
     def sockets(self):
         if not which("ss"):self.inv["sockets"]={};self.mark("sockets","unsupported");return
-        cur=self.run(["ss","-H","-lntup"],"sockets.host");out={"current_namespace":{"parsed_tcp_udp":parse_ss(cur["stdout"])} ,"network_namespaces":[]};ns={}
+        cur=self.run(["ss","-H","-lntup"],"sockets.host");out={"current_namespace":{"parsed_tcp_udp":parse_ss(cur["stdout"])},"network_namespaces":[]};ns={}
         for n in os.listdir("/proc"):
             if n.isdigit():
                 try:ns.setdefault(os.readlink(f"/proc/{n}/ns/net"),[]).append(int(n))
@@ -367,7 +373,7 @@ def render(inv):
     L += ["","## Coverage / blind spots",""]
     bad=[x for x in inv.get("coverage",[]) if x.get("status")!="ok"]
     L += [f"- **{x.get('status')}** `{x.get('collector')}`: {md(x.get('detail'))}" for x in bad] or ["All implemented collectors completed successfully."]
-    L += ["","## Notes","","- Container declared ports are not host reservations; published ports and actual per-netns listeners are shown separately.","- `effective_startup=socket-activated` means a disabled service can still start through an enabled socket.","- `shared/overlay` includes RFC 6598 shared address space such as Tailscale 100.64.0.0/10; it is not classified as public Internet space.","- Local firewall summaries do not include cloud firewalls, external load balancers, DNS, or remote tunnel control planes.","- Same-host tools cannot prove absence of kernel/rootkit concealment.",""];return "\n".join(L)
+    L += ["","## Notes","","- Container declared ports are not host reservations; published ports and actual per-netns listeners are shown separately.","- `effective_startup=socket-activated` means a disabled service can still start through an enabled socket.","- `shared/overlay` includes RFC 6598 shared address space such as Tailscale 100.64.0.0/10; it is not classified as public Internet space.","- Local firewall summaries do not include cloud firewalls, external load balancers, DNS, or remote tunnel control planes.","- The VPS Inspector scanner process itself is excluded from process inventory and business-process summaries so the scan does not report itself as workload.","- Same-host tools cannot prove absence of kernel/rootkit concealment.",""];return "\n".join(L)
 
 def write_outputs(inv,out):
     out.mkdir(parents=True,exist_ok=True)
@@ -391,12 +397,12 @@ def afam(a):
 def addr_conflict(a,b,v6only="0"):
     a=a.strip("[]");b=b.strip("[]")
     if a==b:return True
-    fa,fb=afam(a),afam(b)
     if a in {"","*"} or b in {"","*"}:return True
-    if a=="0.0.0.0":return fb in {None,4}
-    if b=="0.0.0.0":return fa in {None,4}
-    if a=="::":return fb in {None,6} or (fb==4 and v6only!="1")
-    if b=="::":return fa in {None,6} or (fa==4 and v6only!="1")
+    fa,fb=afam(a),afam(b)
+    if a=="::":return fb==6 or (fb==4 and v6only!="1")
+    if b=="::":return fa==6 or (fa==4 and v6only!="1")
+    if a=="0.0.0.0":return fb==4
+    if b=="0.0.0.0":return fa==4
     return False
 
 def bindings(inv)->Iterable[Dict[str,Any]]:
