@@ -1,129 +1,257 @@
 # VPS Inspector
 
-一个面向 Linux VPS 的**只读环境盘点工具**。目标不是维护一份“已知服务名称列表”，而是从系统实际可观察对象出发，盘点进程、端口、systemd、网络命名空间、容器、网络、磁盘、软件包和资源状态，帮助你在升级系统或部署新服务前了解现有环境。
+一个以**只读盘点 + 部署冲突预检**为目标的 Linux VPS 环境检查工具。
 
-> 当前版本：v0.1.0（第一版）。它会明确记录覆盖缺口，不宣称能够从一台可能已被内核级恶意程序控制的主机内部证明“绝无隐藏对象”。
+它不依赖“已知服务名称列表”，而是尽量从 `/proc`、systemd、socket、network namespace、容器运行时、网络、存储和包管理器等底层事实出发，记录当前 VPS 上实际可观察到的对象。遇到权限不足、缺少命令或无法检查的范围，会明确写入 `coverage.json`，而不是把“没看到”误判成“没有”。
 
-## 第一版覆盖范围
+## v0.1.0 能做什么
 
-- 系统：发行版、内核、架构、虚拟化、启动 ID、运行时间、当前权限
-- 进程：直接枚举 `/proc`，记录 PID/PPID、用户、命令、可执行文件、工作目录、cgroup、网络命名空间
-- 端口：TCP/UDP 监听和 Unix socket，保留进程关联信息
-- 网络命名空间：从 `/proc/*/ns/net` 枚举；root + `nsenter` + `ss` 时逐个命名空间检查监听端口
-- systemd：当前/全部 units、unit files、socket units、timers、failed units
-- 定时任务：`/etc/crontab`、`/etc/cron.d` 和常见用户 crontab spool（权限允许时）
-- Docker：强制查询本机 `/var/run/docker.sock`，列出运行/停止容器、端口、网络、挂载、重启策略和标签
-- Podman：当前用户可见容器；明确提示其他用户 rootless 容器的可见性限制
-- 网络：地址、路由、策略路由、nftables/iptables、IPv4/IPv6 转发、临时端口范围/保留端口
-- 存储：文件系统、inode、挂载和块设备
-- 软件包：支持 dpkg、rpm、apk
-- 资源：CPU 数、loadavg、内存和 PSI pressure
-- 维护：选定 SSH 有效配置、reboot-required 状态
-- 输出：`report.md`、`inventory.json`、`coverage.json`
-- 快照比较：`diff` 子命令
+- 系统：发行版、内核、架构、虚拟化、init、运行时长、root 权限状态
+- 进程：PID、PPID、用户、可执行文件、工作目录、命令行、cgroup、namespace 信息
+- systemd：当前/历史 unit、unit files、socket activation、timer
+- cron：系统 cron 文件与目录清单
+- 端口：TCP/UDP/Unix socket 监听情况
+- network namespace：发现 `/proc/*/ns/net`，root 模式下尝试通过 `nsenter` 在每个 namespace 内执行宿主机 `ss`
+- 网络：地址、路由、策略规则、转发状态、临时端口范围、保留端口、nftables/iptables
+- Docker：运行中和已停止容器、端口映射、mount、restart policy、network、volume
+- Podman：检测并盘点当前可见容器
+- CRI：存在 `crictl` 时执行容器运行时盘点
+- 存储：磁盘、文件系统、mount、inode
+- 软件：dpkg/rpm 包清单、APT hold
+- 资源：CPU、load、memory、swap、Linux PSI
+- SSH / 用户：SSH 配置位置与哈希、系统用户概要
+- Coverage：每个采集器记录 `ok / partial / unsupported / permission_denied / timeout / error`
 
-## 最推荐的运行方式
+## 安全设计
 
-先下载脚本：
+`scan` 默认只读，不会：
+
+- 安装或卸载软件
+- 升级系统
+- restart/stop/start 服务
+- 修改 firewall / sysctl
+- 删除容器、镜像或 volume
+- 修改现有配置
+
+它只会创建自己的报告目录。系统命令本身可能产生正常日志，因此这里的“只读”不等于操作系统层面绝对零写入。
+
+`inventory.json` 可能包含 hostname、IP、路径、包版本、进程参数和容器 metadata。脚本会做基础 secret-like 参数脱敏，但不要未经人工检查直接公开报告。
+
+## 推荐运行方式
+
+VPS 上直接复制：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/tns80/vps-inspector/main/vps_inspector.py -o vps_inspector.py
-chmod 700 vps_inspector.py
+git clone https://github.com/tns80/vps-inspector.git
+cd vps-inspector
+sudo python3 vps_inspector.py scan
 ```
 
-仓库当前为 Private 时，GitHub 的 raw URL 不能匿名下载。此时可以在你自己的电脑 `git clone` 后上传脚本，或者把仓库改成 Public。也可以直接从 GitHub 网页复制 `vps_inspector.py` 到 VPS。
+成功后会看到：
 
-先以普通用户运行也可以，但为了最大化 `/proc`、端口、防火墙、网络命名空间、Docker 和系统配置的可见范围，正式盘点推荐：
+```text
+VPS Inspector 0.1.0 completed
+Report:    vps-inspector-YYYYmmdd-HHMMSS/report.md
+Inventory: vps-inspector-YYYYmmdd-HHMMSS/inventory.json
+Coverage:  vps-inspector-YYYYmmdd-HHMMSS/coverage.json
+Tip: run with sudo/root for broader process, namespace, firewall and container visibility.
+```
+
+查看人类可读报告：
 
 ```bash
-sudo python3 ./vps_inspector.py scan -o ./vps-scan-before-change
+sudo cat vps-inspector-*/report.md
 ```
 
-完成后：
+建议第一次正式使用固定输出目录：
 
 ```bash
-sudo less ./vps-scan-before-change/report.md
-sudo less ./vps-scan-before-change/coverage.json
+sudo python3 vps_inspector.py scan -o /root/vps-snapshot-before-upgrade
+sudo less /root/vps-snapshot-before-upgrade/report.md
 ```
 
-如果你要把报告复制给 ChatGPT 或其他人分析，优先复制 `report.md`；需要更深入分析时再提供 `inventory.json` 和 `coverage.json`。输出可能包含主机名、IP、进程命令、路径、容器标签等环境信息，分享前请自行检查。
+## 三个输出文件分别是什么
 
-## 升级前后比较
+```text
+/root/vps-snapshot-before-upgrade/
+├── report.md       # 给人看的摘要
+├── inventory.json  # 完整结构化盘点结果
+└── coverage.json   # 哪些检查成功、失败、权限不足或工具缺失
+```
+
+其中最重要的不只是 `report.md`，还包括 `coverage.json`。例如：
+
+```json
+[
+  {
+    "collector": "sockets.namespace_coverage",
+    "status": "partial",
+    "detail": "discovered=6, proc_denied=1"
+  },
+  {
+    "collector": "podman",
+    "status": "unsupported",
+    "detail": "podman not found"
+  }
+]
+```
+
+这种情况下不能说“系统只有 6 个 namespace”或“没有 Podman 容器”，只能说当前检查范围内发现了这些结果。
+
+## 系统升级前后对比
 
 升级前：
 
 ```bash
-sudo python3 ./vps_inspector.py scan -o ./before
+sudo python3 vps_inspector.py scan -o /root/vps-before
 ```
 
-升级或部署完成后：
+系统升级、重启后：
 
 ```bash
-sudo python3 ./vps_inspector.py scan -o ./after
+sudo python3 vps_inspector.py scan -o /root/vps-after
 ```
 
-比较两个机器可读快照：
+对比：
 
 ```bash
-python3 ./vps_inspector.py diff ./before/inventory.json ./after/inventory.json > diff.txt
-less diff.txt
+python3 vps_inspector.py diff \
+  /root/vps-before/inventory.json \
+  /root/vps-after/inventory.json \
+  -o /root/vps-upgrade.diff
+
+less /root/vps-upgrade.diff
 ```
 
-## 输出说明
+`diff` 返回码：
 
-### `report.md`
+```text
+0 = 没有差异
+1 = 检测到差异
+```
 
-给人阅读的摘要，重点展示覆盖情况、进程数量、网络命名空间、容器、监听端口、systemd、磁盘和网络状态。
+## 新服务部署冲突预检
 
-### `inventory.json`
+先复制示例：
 
-完整的结构化采集结果。后续版本的冲突检查、升级风险分析和自动化比较都基于它。
+```bash
+cp deployment-plan.example.json my-service.json
+nano my-service.json
+```
 
-### `coverage.json`
+示例：
 
-非常重要。记录每个采集模块是否成功，以及工具本身已知的观察边界。`unsupported`、`partial`、`permission_denied`、`error` 都不应该被解释成“该对象不存在”。
+```json
+{
+  "name": "new-service",
+  "deployment": "docker",
+  "network_mode": "bridge",
+  "host_bindings": [
+    {
+      "address": "127.0.0.1",
+      "port": 8080,
+      "protocol": "tcp"
+    }
+  ],
+  "data_paths": [
+    "/srv/new-service/data"
+  ],
+  "domains": [
+    "app.example.com"
+  ],
+  "memory_budget_mb": 512
+}
+```
 
-## 安全设计
+检查：
 
-脚本第一版遵循这些原则：
+```bash
+python3 vps_inspector.py check \
+  /root/vps-before/inventory.json \
+  my-service.json
+```
 
-1. 不安装/卸载软件，不运行 apt/yum/dnf upgrade，不启动、停止或重启服务。
-2. 不修改防火墙、sysctl、网络、容器或 systemd 配置。
-3. 不执行扫描过程中发现的未知二进制文件。
-4. 外部命令使用固定参数、超时和输出大小限制。
-5. 对常见 `password=...`、`token=...`、`secret=...`、`api_key=...` 形式做基础脱敏。
-6. 输出目录权限设为仅当前用户可访问（0700）。
-7. Docker 查询显式指向本机 `/var/run/docker.sock`，避免当前 Docker context 意外指向其他服务器。
+v0.1 当前会检查：
 
-基础脱敏无法覆盖所有软件自定义的秘密格式，因此报告仍应按敏感系统信息处理。
+- 当前实际监听 TCP/UDP 端口冲突
+- Docker published port 冲突
+- 已停止 Docker 容器仍配置的 published port 冲突
+- Docker bind mount 与计划数据目录重叠
+- 当前机器上计划目录已经存在
 
-## 当前明确限制
+例如：
 
-- 单次扫描是时间点快照，极短生命周期进程可能在扫描间隙出现并退出。
-- 如果 VPS 内核或系统工具已经被 rootkit/攻击者控制，主机内部脚本无法独立证明采集结果可信。
-- 云厂商安全组、外部负载均衡、DNS/CDN 控制面、第三方 Tunnel 等外部状态需要对应平台 API 才能完整核验。
-- v0.1 不会穷举解析所有软件的配置文件；未知软件仍尽可能通过进程、socket、cgroup 和网络命名空间呈现。
-- rootless Docker/Podman 可能存在于不同用户会话；v0.1 已标记这一缺口，后续版本会加强多用户运行时发现。
-- 当前 `diff` 是结构化 JSON 的统一 diff，还没有进行“语义级变化归类”。
+```json
+{
+  "type": "port_conflict",
+  "severity": "high",
+  "wanted": {
+    "address": "127.0.0.1",
+    "port": 8080,
+    "protocol": "tcp"
+  },
+  "existing": {
+    "source": "socket",
+    "protocol": "tcp",
+    "address": "0.0.0.0",
+    "port": 8080
+  }
+}
+```
 
-## Roadmap
+因为 `0.0.0.0:8080` 会覆盖所有 IPv4 本地地址，所以它与 `127.0.0.1:8080` 构成冲突。
 
-下一阶段计划：
+`check` 返回码：
 
-- `check`：读取 `deployment-plan.json`，判断新服务的端口、目录、网络、资源等冲突
-- 更强的 rootless Docker/Podman/containerd/CRI 发现
-- socket → PID → systemd unit → container 的统一关联图
-- systemd 用户级服务、更多启动机制和 supervisor/PM2 等进程管理器识别
-- Docker Compose 项目关联和潜在端口（包括停止容器）分析
-- 配置声明端口与实际监听端口交叉验证
-- apt/dnf 升级模拟与升级风险报告（仍保持默认只读）
-- 语义化 snapshot diff
-- 可选 `observe` 模式捕获短生命周期变化
+```text
+0 = 当前规则和覆盖范围内未发现冲突
+1 = 有非高危发现
+2 = 有高危冲突
+```
 
-## Python 版本
+“未发现冲突”只代表当前 snapshot 的检查范围内没有发现，不代表该端口永久可用，也不代表外部 cloud firewall、负载均衡、DNS 或 tunnel 不会影响部署。
 
-建议 Python 3.9+。不依赖第三方 Python 包。
+## 依赖
 
-## License
+必须：
 
-第一版暂未添加开源许可证。在你确定希望使用 MIT、Apache-2.0 或保持私有后再添加。
+```text
+Linux
+Python 3.8+
+```
+
+推荐存在以下系统工具，可提升覆盖率：
+
+```text
+ss
+ip
+systemctl
+nsenter
+nft
+lsblk
+docker
+podman
+crictl
+```
+
+缺什么不会自动安装，而是明确记录为 `unsupported`。
+
+## 关于“不会遗漏”
+
+同一台 VPS 内运行的脚本无法对以下情况做绝对保证：恶意 kernel/rootkit、被篡改的内核接口、被劫持的系统工具，或者 VPS 外部的 cloud security group、load balancer、DNS、反向隧道控制面。
+
+这个项目的目标是：
+
+> 不因为“不认识某个新服务”就漏掉它；尽量从进程、socket、namespace、容器、启动机制和配置事实发现它，并明确告诉你哪些范围没有检查成功。
+
+## v0.2 计划
+
+- 更完整的 rootless Docker / Podman 多用户运行时枚举
+- 更稳健的 `ss` 结构化解析和 PID ↔ socket ↔ systemd unit 关联
+- nginx / Caddy / Traefik 等反向代理的 domain/upstream 关联
+- Cloudflare Tunnel 等本机 tunnel 客户端检测
+- APT/DNF 系统升级模拟与潜在 restart/reboot 影响分析
+- Docker Compose project 关联
+- 网络段/容器网段与新部署 subnet 冲突检查
+- 语义化升级前后差异报告，而不是只做 JSON unified diff
+- 可选 transient event 观察模式
