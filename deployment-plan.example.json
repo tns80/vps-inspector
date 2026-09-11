@@ -1,0 +1,19 @@
+{
+  "name": "example-service",
+  "deployment": "docker",
+  "network_mode": "bridge",
+  "host_bindings": [
+    {
+      "address": "127.0.0.1",
+      "port": 8080,
+      "protocol": "tcp"
+    }
+  ],
+  "data_paths": [
+    "/srv/example-service/data"
+  ],
+  "domains": [
+    "app.example.com"
+  ],
+  "memory_budget_mb": 512
+}
