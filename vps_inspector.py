@@ -2,7 +2,7 @@
 """VPS Inspector v0.3.0 - read-only Linux VPS inventory and deployment preflight."""
 from __future__ import annotations
 import argparse, datetime as dt, difflib, hashlib, ipaddress, json, os, pathlib, platform, pwd, re, shutil, socket, subprocess
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 VERSION="0.3.0"; SCHEMA_VERSION=4; DEFAULT_TIMEOUT=8; MAX_OUTPUT=2_000_000
 SENSITIVE=[re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)=([^\s]+)"),re.compile(r"(?i)(--password|--passwd|--token|--secret|--api-key)\s+([^\s]+)")]
@@ -31,6 +31,7 @@ def scope(addr):
         if ip.is_private:return "private/overlay"
         return "specific/public"
     except ValueError:return "specific"
+
 def split_host_port(v):
     m=re.match(r"^\[(.*)\]:(\d+)$",v)
     if m:return m.group(1),int(m.group(2))
@@ -38,6 +39,7 @@ def split_host_port(v):
         h,p=v.rsplit(":",1)
         if p.isdigit():return h,int(p)
     return v or None,None
+
 def parse_ss(text):
     out=[]
     for line in text.splitlines():
@@ -67,7 +69,12 @@ class Inspector:
             if "=" in l and not l.startswith("#"):k,v=l.split("=",1);o[k]=v.strip().strip('"')
         try: ns=os.readlink("/proc/1/ns/net")
         except OSError: ns=None
-        self.inv["system"]={"hostname":socket.gethostname(),"platform":platform.platform(),"kernel":platform.release(),"architecture":platform.machine(),"python":platform.python_version(),"uid":os.geteuid(),"is_root":os.geteuid()==0,"os_release":o,"host_netns":ns};self.mark("system","ok")
+        virt=self.run(["systemd-detect-virt"],"virtualization")["stdout"].strip() if which("systemd-detect-virt") else None
+        try:init=os.path.basename(os.readlink("/proc/1/exe"))
+        except OSError:init=None
+        try:uptime=float((read("/proc/uptime",10000) or "0").split()[0])
+        except (ValueError,IndexError):uptime=None
+        self.inv["system"]={"hostname":socket.gethostname(),"fqdn":socket.getfqdn(),"platform":platform.platform(),"kernel":platform.release(),"architecture":platform.machine(),"python":platform.python_version(),"uid":os.geteuid(),"is_root":os.geteuid()==0,"os_release":o,"host_netns":ns,"virtualization":virt,"init":init,"uptime_seconds":uptime,"boot_id":(read("/proc/sys/kernel/random/boot_id",10000) or "").strip()};self.mark("system","ok")
     def processes(self):
         rows=[];denied=0
         for n in os.listdir("/proc"):
@@ -124,7 +131,8 @@ class Inspector:
             if u:timers.append({"unit":u,"activates":p[-1] if p[-1].endswith(".service") else "","raw":l.strip()})
         self.inv["systemd"]={"available":True,"services":services,"sockets":sorted(by.values(),key=lambda x:x.get("unit","")),"timers":timers}
     def cron(self):
-        files=[];jobs=[];targets=[]
+        files=[];jobs=[]
+        targets=[]
         if pathlib.Path("/etc/crontab").is_file():targets.append((pathlib.Path("/etc/crontab"),True,None))
         d=pathlib.Path("/etc/cron.d")
         if d.is_dir():targets += [(p,True,None) for p in sorted(d.iterdir()) if p.is_file() and not p.name.startswith(".")]
@@ -174,14 +182,15 @@ class Inspector:
             r=self.run(cmd,"network."+k)
             try:out[k]=json.loads(r["stdout"]) if r["ok"] else {"error":r["status"]}
             except json.JSONDecodeError:out[k]=r["stdout"]
-        for k,p in {"ip_forward_v4":"/proc/sys/net/ipv4/ip_forward","ipv6_forwarding_all":"/proc/sys/net/ipv6/conf/all/forwarding","bindv6only":"/proc/sys/net/ipv6/bindv6only"}.items():out[k]=(read(p,10000) or "").strip() or None
+        for k,p in {"ip_forward_v4":"/proc/sys/net/ipv4/ip_forward","ipv6_forwarding_all":"/proc/sys/net/ipv6/conf/all/forwarding","bindv6only":"/proc/sys/net/ipv6/bindv6only","ip_local_port_range":"/proc/sys/net/ipv4/ip_local_port_range","ip_local_reserved_ports":"/proc/sys/net/ipv4/ip_local_reserved_ports"}.items():out[k]=(read(p,10000) or "").strip() or None
+        out["dns_resolv_conf"]=(read("/etc/resolv.conf",50000) or "")
         fw={"engine":"none","interesting_rules":[]}
         if which("nft"):r=self.run(["nft","list","ruleset"],"network.nft",15);fw.update({"engine":"nftables","status":r["status"]})
         elif which("iptables-save"):r=self.run(["iptables-save"],"network.iptables",15);fw.update({"engine":"iptables","status":r["status"]})
         else:r={"stdout":""}
         fw["interesting_rules"]=[md(l) for l in r.get("stdout","").splitlines() if re.search(r"(?i)(dport|sport|dnat|snat|redirect|masquerade|drop|reject|accept)",l)][:500];out["firewall"]=fw;self.inv["network"]=out
     def containers(self):
-        if not which("docker"):docker={"available":False,"containers":[]};self.mark("docker","unsupported")
+        if not which("docker"):docker={"available":False,"containers":[],"networks":[]};self.mark("docker","unsupported")
         else:
             ps=self.run(["docker","ps","-a","--no-trunc","--format","{{.ID}}"],"docker.ps",15);ids=[x for x in ps["stdout"].splitlines() if x];cs=[]
             if ids:
@@ -192,12 +201,33 @@ class Inspector:
                             st=x.get("State") or {};cfg=x.get("Config") or {};hc=x.get("HostConfig") or {};nw=x.get("NetworkSettings") or {};pid=int(st.get("Pid") or 0)
                             try:ns=os.readlink(f"/proc/{pid}/ns/net") if pid else None
                             except OSError:ns=None
-                            cs.append({"Id":x.get("Id"),"Name":cname(x.get("Name")),"netns":ns,"State":{k:st.get(k) for k in ("Status","Running","Pid","ExitCode")},"Config":{"Image":cfg.get("Image"),"ExposedPorts":cfg.get("ExposedPorts")},"HostConfig":{"NetworkMode":hc.get("NetworkMode"),"PortBindings":hc.get("PortBindings"),"RestartPolicy":hc.get("RestartPolicy")},"NetworkSettings":{"Ports":nw.get("Ports"),"Networks":nw.get("Networks")},"Mounts":[{k:m.get(k) for k in ("Type","Source","Destination","RW")} for m in x.get("Mounts") or []]})
+                            labels=cfg.get("Labels") or {};safe_labels={k:v for k,v in labels.items() if not re.search(r"(?i)(secret|token|password|key)",k)}
+                            cs.append({"Id":x.get("Id"),"Name":cname(x.get("Name")),"netns":ns,"State":{k:st.get(k) for k in ("Status","Running","Paused","Restarting","OOMKilled","Dead","Pid","ExitCode")},"Config":{"Image":cfg.get("Image"),"ExposedPorts":cfg.get("ExposedPorts"),"Labels":safe_labels},"HostConfig":{"NetworkMode":hc.get("NetworkMode"),"PortBindings":hc.get("PortBindings"),"RestartPolicy":hc.get("RestartPolicy"),"Privileged":hc.get("Privileged")},"NetworkSettings":{"Ports":nw.get("Ports"),"Networks":nw.get("Networks")},"Mounts":[{k:m.get(k) for k in ("Type","Name","Source","Destination","Mode","RW")} for m in x.get("Mounts") or []]})
                     except json.JSONDecodeError:self.mark("docker.inspect.parse","error")
-            docker={"available":True,"containers":cs}
-        self.inv["containers"]={"docker":docker,"podman":{"available":bool(which("podman"))},"cri":{"available":bool(which("crictl"))}}
-        if not which("podman"):self.mark("podman","unsupported")
-        if not which("crictl"):self.mark("crictl","unsupported")
+            nets=[];nr=self.run(["docker","network","ls","-q"],"docker.network_ls",15);nids=[x for x in nr["stdout"].splitlines() if x]
+            if nids:
+                ni=self.run(["docker","network","inspect",*nids],"docker.network_inspect",25)
+                if ni["ok"]:
+                    try:
+                        for n in json.loads(ni["stdout"]):
+                            ipam=n.get("IPAM") or {};nets.append({"Id":n.get("Id"),"Name":n.get("Name"),"Driver":n.get("Driver"),"Internal":n.get("Internal"),"Config":[{"Subnet":z.get("Subnet"),"Gateway":z.get("Gateway"),"IPRange":z.get("IPRange")} for z in ipam.get("Config") or []]})
+                    except json.JSONDecodeError:self.mark("docker.network_inspect.parse","error")
+            docker={"available":True,"containers":cs,"networks":nets}
+        pod={"available":False,"containers":[]}
+        if which("podman"):
+            pr=self.run(["podman","ps","-a","--no-trunc","--format","json"],"podman.ps",15);pod["available"]=True
+            if pr["ok"]:
+                try:pod["containers"]=json.loads(pr["stdout"] or "[]")
+                except json.JSONDecodeError:self.mark("podman.parse","error")
+        else:self.mark("podman","unsupported")
+        cri={"available":False}
+        if which("crictl"):
+            cr=self.run(["crictl","ps","-a","-o","json"],"crictl.ps",15);cri["available"]=True
+            if cr["ok"]:
+                try:cri["data"]=json.loads(cr["stdout"])
+                except json.JSONDecodeError:self.mark("crictl.parse","error")
+        else:self.mark("crictl","unsupported")
+        self.inv["containers"]={"docker":docker,"podman":pod,"cri":cri}
     def user_systemd(self):
         dirs=[];runtime=[];paths=[pathlib.Path("/etc/systemd/user"),pathlib.Path("/usr/lib/systemd/user")]
         for u in pwd.getpwall():
@@ -215,36 +245,56 @@ class Inspector:
                 uid=int(d.name)
                 try:user=pwd.getpwuid(uid).pw_name
                 except KeyError:user=str(uid)
-                bus=d/"bus";row={"uid":uid,"user":user,"bus_present":bus.exists(),"services":[]};cmd=[]
+                bus=d/"bus";row={"uid":uid,"user":user,"bus_present":bus.exists(),"services":[]}
+                cmd=[]
                 if bus.exists() and which("systemctl"):
                     if uid==os.geteuid():cmd=["systemctl","--user","show","--type=service","--all","--no-pager","--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID,FragmentPath"]
                     elif os.geteuid()==0 and which("runuser"):cmd=["runuser","-u",user,"--","systemctl","--user","show","--type=service","--all","--no-pager","--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID,FragmentPath"]
                 if cmd:
-                    rr=self.run(cmd,f"user_systemd.{uid}",20,{"XDG_RUNTIME_DIR":str(d),"DBUS_SESSION_BUS_ADDRESS":f"unix:path={bus}"});row["status"]=rr["status"];row["services"]=self._blocks(rr["stdout"],".service") if rr["ok"] else []
+                    r=self.run(cmd,f"user_systemd.{uid}",20,{"XDG_RUNTIME_DIR":str(d),"DBUS_SESSION_BUS_ADDRESS":f"unix:path={bus}"});row["status"]=r["status"];row["services"]=self._blocks(r["stdout"],".service") if r["ok"] else []
                 else:row["status"]="no_bus" if not bus.exists() else "not_inspected"
                 runtime.append(row)
         self.inv["user_systemd"]={"unit_directories":dirs,"runtime_users":runtime};self.mark("user_systemd","ok")
     def misc(self):
-        st={}
+        st={"mountinfo":read("/proc/self/mountinfo",1_000_000) or ""}
         for k,c in {"df":["df","-PT","-x","tmpfs","-x","devtmpfs"],"inodes":["df","-Pi","-x","tmpfs","-x","devtmpfs"]}.items():st[k]=self.run(c,"storage."+k)["stdout"]
+        if which("lsblk"):
+            lr=self.run(["lsblk","-J","-o","NAME,KNAME,TYPE,SIZE,FSTYPE,FSVER,LABEL,UUID,MOUNTPOINTS"],"storage.lsblk",15)
+            if lr["ok"]:
+                try:st["lsblk"]=json.loads(lr["stdout"])
+                except json.JSONDecodeError:st["lsblk_raw"]=lr["stdout"]
         self.inv["storage"]=st;pk=[];mgr=None
         if which("dpkg-query"):r=self.run(["dpkg-query","-W","-f=${binary:Package}\t${Version}\n"],"packages.dpkg",25);pk=[x for x in r["stdout"].splitlines() if x];mgr="dpkg"
         elif which("rpm"):r=self.run(["rpm","-qa","--qf","%{NAME}\t%{VERSION}-%{RELEASE}.%{ARCH}\n"],"packages.rpm",25);pk=[x for x in r["stdout"].splitlines() if x];mgr="rpm"
-        self.inv["packages"]={"manager":mgr,"installed":pk,"count":len(pk)};self.inv["resources"]={"cpu_count":os.cpu_count(),"meminfo":read("/proc/meminfo",100000),"swaps":read("/proc/swaps",100000)}
+        elif which("apk"):r=self.run(["apk","info","-vv"],"packages.apk",25);pk=[x for x in r["stdout"].splitlines() if x];mgr="apk"
+        else:self.mark("packages","unsupported","no supported package query tool")
+        self.inv["packages"]={"manager":mgr,"installed":pk,"count":len(pk)}
+        pressure={k:read(f"/proc/pressure/{k}",100000) for k in ("cpu","memory","io") if pathlib.Path(f"/proc/pressure/{k}").exists()}
+        self.inv["resources"]={"cpu_count":os.cpu_count(),"loadavg":os.getloadavg() if hasattr(os,"getloadavg") else None,"meminfo":read("/proc/meminfo",100000),"swaps":read("/proc/swaps",100000),"pressure":pressure}
+        sec={"sshd_config_locations":[],"users":[]}
+        for p in ("/etc/ssh/sshd_config","/etc/ssh/sshd_config.d"):
+            q=pathlib.Path(p)
+            try:
+                if q.is_file():sec["sshd_config_locations"].append({"path":p,"sha256":hashlib.sha256(q.read_bytes()).hexdigest()})
+                elif q.is_dir():sec["sshd_config_locations"].append({"path":p,"files":sorted(x.name for x in q.glob("*.conf"))})
+            except PermissionError:sec["sshd_config_locations"].append({"path":p,"error":"permission_denied"})
+        for u in pwd.getpwall():sec["users"].append({"name":u.pw_name,"uid":u.pw_uid,"gid":u.pw_gid,"home":u.pw_dir,"shell":u.pw_shell})
+        self.inv["security_summary"]=sec;self.mark("resources","ok");self.mark("security_summary","ok")
     def relationships(self):
         procs=self.inv.get("processes",[]);pb={p["pid"]:p for p in procs};svcs={s["unit"]:dict(s) for s in self.inv.get("systemd",{}).get("services",[])}
         for s in svcs.values():
             ids=sorted({p["pid"] for p in procs if p.get("systemd_service")==s["unit"]}|({s["main_pid"]} if s.get("main_pid") else set()));s["processes"]=[{"pid":i,"name":pb.get(i,{}).get("name")} for i in ids if i in pb];s["listeners"]=[]
-        dports={};dns={}
+        dports=[];dns={}
         for c in self.inv.get("containers",{}).get("docker",{}).get("containers",[]):
             if c.get("netns"):dns[c["netns"]]=c["Name"]
             for cp,vals in (c.get("HostConfig",{}).get("PortBindings") or {}).items():
                 for v in vals or []:
                     hp=str(v.get("HostPort") or "")
-                    if hp.isdigit():dports.setdefault((proto(cp.split("/")[-1]),int(hp)),[]).append(c["Name"])
-        listeners=[]
+                    if hp.isdigit():dports.append({"proto":proto(cp.split("/")[-1]),"port":int(hp),"address":v.get("HostIp") or "0.0.0.0","container":c["Name"]})
+        listeners=[];v6=str(self.inv.get("network",{}).get("bindv6only") or "0")
         for x in self.inv.get("sockets",{}).get("current_namespace",{}).get("parsed_tcp_udp",[]):
-            y=dict(x);owners=sorted({pb.get(i,{}).get("systemd_service") for i in x.get("pids",[]) if pb.get(i,{}).get("systemd_service")});y["systemd_services"]=owners;y["docker_containers"]=sorted(set(dports.get((proto(x.get("proto")),int(x.get("port") or 0)),[]))) if x.get("port") else []
+            y=dict(x);owners=sorted({pb.get(i,{}).get("systemd_service") for i in x.get("pids",[]) if pb.get(i,{}).get("systemd_service")});y["systemd_services"]=owners
+            y["docker_containers"]=sorted({b["container"] for b in dports if x.get("port") and b["proto"]==proto(x.get("proto")) and b["port"]==int(x["port"]) and addr_conflict(str(b["address"]),str(x.get("address") or "*"),v6)})
             for o in owners:
                 if o in svcs:svcs[o]["listeners"].append(y)
             listeners.append(y)
@@ -253,7 +303,8 @@ class Inspector:
             for target in str(s.get("triggers") or "").split():
                 if target.endswith(".service"):tmap.setdefault(target,[]).append(s)
         for n,s in svcs.items():
-            ts=tmap.get(n,[]);ufs=s.get("unit_file_state");s["activating_sockets"]=[x.get("unit") for x in ts];s["effective_startup"]="enabled" if ufs in {"enabled","enabled-runtime"} else ("socket-activated" if any(x.get("unit_file_state") in {"enabled","enabled-runtime"} for x in ts) else ("static/dependency" if ufs=="static" else (ufs or "unknown")))
+            ts=tmap.get(n,[]);ufs=s.get("unit_file_state")
+            s["activating_sockets"]=[x.get("unit") for x in ts];s["effective_startup"]="enabled" if ufs in {"enabled","enabled-runtime"} else ("socket-activated" if any(x.get("unit_file_state") in {"enabled","enabled-runtime"} for x in ts) else ("static/dependency" if ufs=="static" else (ufs or "unknown")))
         hostns=self.inv.get("system",{}).get("host_netns");nss=[]
         for x in self.inv.get("sockets",{}).get("network_namespaces",[]):
             y=dict(x);y["kind"]="host" if x.get("namespace")==hostns else ("docker" if x.get("namespace") in dns else "other");y["docker_container"]=dns.get(x.get("namespace"));nss.append(y)
@@ -278,7 +329,9 @@ def render(inv):
         L.append(f"| `{md(x.get('namespace'))}` | {x.get('kind')} | `{md(x.get('docker_container'))}` | {x.get('representative_pid')} | {md(actual)} |")
     L += ["","## Docker",""]
     for c in inv.get("containers",{}).get("docker",{}).get("containers",[]):L += [f"### `{c['Name']}`",f"- State: `{c.get('State',{}).get('Status')}`; netns: `{c.get('netns') or ''}`",f"- Declared container ports: `{json.dumps(c.get('Config',{}).get('ExposedPorts') or {},ensure_ascii=False)}`",f"- Host-published ports: `{json.dumps(c.get('NetworkSettings',{}).get('Ports') or {},ensure_ascii=False)}`"]+[f"- Mount: `{m.get('Source')}` -> `{m.get('Destination')}`" for m in c.get("Mounts",[])]+[""]
-    L += ["## systemd socket activation","","| Socket | State | Startup | Triggers | Listen |","|---|---|---|---|---|"]
+    nets=inv.get("containers",{}).get("docker",{}).get("networks",[]);L += ["## Docker networks","","| Network | Driver | Internal | Subnets |","|---|---|---|---|"]
+    for n in nets:L.append(f"| `{md(n.get('Name'))}` | `{md(n.get('Driver'))}` | `{n.get('Internal')}` | `{md(', '.join(z.get('Subnet') or '' for z in n.get('Config',[]) if z.get('Subnet')))}` |")
+    L += ["","## systemd socket activation","","| Socket | State | Startup | Triggers | Listen |","|---|---|---|---|---|"]
     for x in inv.get("systemd",{}).get("sockets",[]):L.append(f"| `{md(x.get('unit'))}` | `{md(x.get('active_state'))}/{md(x.get('sub_state'))}` | `{md(x.get('unit_file_state') or 'unknown')}` | `{md(x.get('triggers'))}` | `{md(x.get('listen'))}` |")
     L += ["","## Cron jobs",""]
     if inv["cron"]["jobs"]:
@@ -309,6 +362,7 @@ def normalized(x):
     if isinstance(x,dict):return {k:normalized(v) for k,v in sorted(x.items()) if k not in {"collected_at","coverage"}}
     if isinstance(x,list):return [normalized(v) for v in x]
     return x
+
 def afam(a):
     a=(a or "").strip("[]").split("%",1)[0]
     if a in {"","*"}:return None
@@ -324,19 +378,41 @@ def addr_conflict(a,b,v6only="0"):
     if a=="::":return fb in {None,6} or (fb==4 and v6only!="1")
     if b=="::":return fa in {None,6} or (fa==4 and v6only!="1")
     return False
+
 def bindings(inv)->Iterable[Dict[str,Any]]:
-    for x in inv.get("relationships",{}).get("listeners",[]):
-        if x.get("port"):yield {"source":"socket","protocol":proto(x.get("proto")),"address":x.get("address") or "*","port":int(x["port"]),"detail":x.get("process")}
+    observed=inv.get("relationships",{}).get("listeners",[])
+    v6=str(inv.get("network",{}).get("bindv6only") or "0")
+    for x in observed:
+        if x.get("port"):
+            yield {"source":"socket","protocol":proto(x.get("proto")),"address":x.get("address") or "*","port":int(x["port"]),"detail":x.get("process"),"systemd_services":x.get("systemd_services",[]),"docker_containers":x.get("docker_containers",[])}
     for c in inv.get("containers",{}).get("docker",{}).get("containers",[]):
+        running=bool(c.get("State",{}).get("Running"))
         for cp,vals in (c.get("HostConfig",{}).get("PortBindings") or {}).items():
+            cp_proto=proto(cp.split("/")[-1])
             for v in vals or []:
                 hp=str(v.get("HostPort") or "")
-                if hp.isdigit():yield {"source":"docker","protocol":proto(cp.split("/")[-1]),"address":v.get("HostIp") or "0.0.0.0","port":int(hp),"detail":c["Name"]}
+                if not hp.isdigit():continue
+                bind_addr=str(v.get("HostIp") or "0.0.0.0");port=int(hp)
+                seen_runtime=running and any(proto(x.get("proto"))==cp_proto and int(x.get("port") or 0)==port and addr_conflict(bind_addr,str(x.get("address") or "*"),v6) for x in observed)
+                if not seen_runtime:
+                    yield {"source":"docker_config","protocol":cp_proto,"address":bind_addr,"port":port,"detail":c["Name"],"container_running":running}
+
 def check(snapshot,plan):
     inv=json.loads(snapshot.read_text());p=json.loads(plan.read_text());f=[];v6=str(inv.get("network",{}).get("bindv6only") or "0")
     for w in p.get("host_bindings",[]):
         for h in bindings(inv):
             if proto(h["protocol"])==proto(w.get("protocol","tcp")) and h["port"]==int(w["port"]) and addr_conflict(str(h["address"]),str(w.get("address","0.0.0.0")),v6):f.append({"type":"port_conflict","severity":"high","wanted":w,"existing":h})
+    for wanted in p.get("network_cidrs",[]):
+        try:wn=ipaddress.ip_network(str(wanted),strict=False)
+        except ValueError:
+            f.append({"type":"invalid_network_cidr","severity":"medium","cidr":wanted});continue
+        for n in inv.get("containers",{}).get("docker",{}).get("networks",[]):
+            for cfg in n.get("Config",[]):
+                sub=cfg.get("Subnet")
+                if not sub:continue
+                try:en=ipaddress.ip_network(sub,strict=False)
+                except ValueError:continue
+                if wn.version==en.version and wn.overlaps(en):f.append({"type":"docker_subnet_overlap","severity":"high","wanted":str(wn),"existing":{"network":n.get("Name"),"subnet":str(en)}})
     for path in p.get("data_paths",[]):
         q=os.path.abspath(os.path.expanduser(path))
         if pathlib.Path(q).exists():f.append({"type":"path_exists","severity":"medium","path":q})
@@ -349,6 +425,7 @@ def check(snapshot,plan):
         k=json.dumps(x,sort_keys=True,ensure_ascii=False)
         if k not in seen:seen.add(k);ded.append(x)
     print(json.dumps({"plan":p.get("name"),"checked_snapshot":str(snapshot),"findings":ded,"coverage_warning":"No conflict found means only no conflict was observed within this snapshot's checked scope."},indent=2,ensure_ascii=False));return 2 if any(x["severity"]=="high" for x in ded) else (1 if ded else 0)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument("--version",action="version",version=f"vps-inspector {VERSION}");s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("scan");a.add_argument("-o","--output");a.add_argument("--timeout",type=int,default=DEFAULT_TIMEOUT)
