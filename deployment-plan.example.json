@@ -1,5 +1,5 @@
 {
-  "name": "example-service",
+  "name": "new-service",
   "deployment": "docker",
   "network_mode": "bridge",
   "host_bindings": [
@@ -10,7 +10,7 @@
     }
   ],
   "data_paths": [
-    "/srv/example-service/data"
+    "/srv/new-service/data"
   ],
   "domains": [
     "app.example.com"
