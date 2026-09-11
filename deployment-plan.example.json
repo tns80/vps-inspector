@@ -9,6 +9,9 @@
       "protocol": "tcp"
     }
   ],
+  "network_cidrs": [
+    "172.30.0.0/16"
+  ],
   "data_paths": [
     "/srv/new-service/data"
   ],
